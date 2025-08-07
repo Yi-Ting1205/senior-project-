@@ -188,7 +188,8 @@ def predict():
         return jsonify({"error": "僅支持CSV文件"}), 400
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    port = int(os.environ.get("PORT", 8000))
+    app.run(host="0.0.0.0", port=port, debug=False)
     
 # from flask import Flask, request, jsonify
 # import pandas as pd
