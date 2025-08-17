@@ -291,6 +291,16 @@ import io
 from datetime import datetime
 import sqlite3
 
+import os  # 必须导入
+from fastapi import FastAPI
+import tensorflow as tf
+
+# 禁用GPU加速
+tf.config.set_visible_devices([], 'GPU')
+@app.get("/")
+def read_root():
+    return {"status": "API is running"}
+
 # 初始化資料庫（只需執行一次）
 def init_db():
     conn = sqlite3.connect('gait_results.db')
@@ -301,6 +311,7 @@ def init_db():
     conn.close()
 
 app = FastAPI()
+init_db()  # 确保数据库表已创建
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  
@@ -428,12 +439,18 @@ async def get_results(user_id: str = "current_user"):
     conn.close()
     return {"status": "success", "results": results}
 
-# 在檔案結尾修改啟動代碼
+# 替换文件最后的启动代码为：
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))  # Render 會自動注入 $PORT
-    uvicorn.run(app, host="0.0.0.0", port=port)
-
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(
+        "server:app",  # 注意这里必须是字符串格式
+        host="0.0.0.0",
+        port=port,
+        workers=1,  # Render免费版只支持单worker
+        timeout_keep_alive=60
+    )
+        
 # import os  # 新增：必须导入 os 模块
 # from flask import Flask, request, jsonify
 # import pandas as pd
