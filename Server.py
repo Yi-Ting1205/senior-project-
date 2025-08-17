@@ -419,7 +419,7 @@ async def analyze_flatfoot(file: UploadFile = File(...)):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 # 新增結果查詢端點
-@app.get("/get_flatfoot_results/")
+@app.get("/get_flatfoot_results/")  # 注意結尾的斜線
 async def get_results(user_id: str = "current_user"):
     conn = sqlite3.connect('gait_results.db')
     c = conn.cursor()
