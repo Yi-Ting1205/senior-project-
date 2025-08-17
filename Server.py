@@ -281,110 +281,60 @@
 # if __name__ == "__main__":
 #     port = int(os.environ.get("PORT", 8000))
 #     app.run(host="0.0.0.0", port=port, debug=False)
-
-
-from flask import Flask, request, jsonify
+from fastapi.middleware.cors import CORSMiddleware
+from tensorflow.keras.models import load_model
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import JSONResponse
 import pandas as pd
 import numpy as np
-from tensorflow.keras.models import load_model
-import os
-import logging
-from io import StringIO
+import io
+from datetime import datetime
+import sqlite3
 
-# 初始化 Flask 應用
-app = Flask(__name__)
+# 初始化資料庫（只需執行一次）
+def init_db():
+    conn = sqlite3.connect('gait_results.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS flatfoot_results
+                 (timestamp TEXT, probability REAL, diagnosis TEXT, user_id TEXT)''')
+    conn.commit()
+    conn.close()
 
-# 配置日誌
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+model = load_model("gait_model_5.h5")
 
-# 禁用 GPU（Render 只支持 CPU）
-os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
-
-# 載入模型（放在全局範圍避免重複加載）
-try:
-    # 步態分析模型
-    gait_model = load_model("gait_model_5.h5")
-    # 足弓分析模型（新增）
-    arch_model = load_model("arch_model.h5") 
-    logger.info("模型加載成功")
-except Exception as e:
-    logger.error(f"模型加載失敗: {str(e)}")
-    gait_model = None
-    arch_model = None
-
-# 特徵提取函數（用於足弓分析）
-def extract_arch_features(df):
-    """
-    從原始數據提取足弓分析特徵
-    返回: 特徵向量 (n_features,)
-    """
-    features = []
-    
-    # 1. 陀螺儀Z軸特徵
-    gyro_z = df["Gyroscope_Z"].values
-    features.extend([
-        np.mean(gyro_z),        # 平均值
-        np.std(gyro_z),         # 標準差
-        np.max(gyro_z),         # 最大值
-        np.min(gyro_z),         # 最小值
-        np.median(gyro_z),      # 中位數
-        np.percentile(gyro_z, 25),  # 25百分位
-        np.percentile(gyro_z, 75),  # 75百分位
-    ])
-    
-    # 2. 加速度計特徵（X/Y/Z）
-    for col in ["Acceleration_X", "Acceleration_Y", "Acceleration_Z"]:
-        acc = df[col].values
-        features.extend([
-            np.mean(acc),
-            np.std(acc),
-            np.max(acc) - np.min(acc),  # 峰峰值
-        ])
-    
-    # 3. 時頻域特徵（示例）
-    fft = np.abs(np.fft.fft(gyro_z))
-    features.extend([
-        np.mean(fft[:len(fft)//2]),  # 低頻能量
-        np.mean(fft[len(fft)//2:]),   # 高頻能量
-    ])
-    
-    return np.array(features)
-
-
-def predict_events(model, test_time, test_gyro, window_size=60, distance=40):
-    """使用模型预测 HS 和 TO 事件"""
-    if model is None:
-        return []
-        
+def predict(model, test_time, test_gyro, window_size=60, distance=40):
     x_pred = []
     pred_events = []
 
-    # 准备滑动窗口数据
     for i in range(window_size, len(test_gyro) - window_size):
-        window = test_gyro[i - window_size : i + window_size + 1].reshape(-1, 1) 
+        window = test_gyro[i - window_size : i + window_size + 1 ].reshape(-1, 1) 
         x_pred.append(window)
 
     x_pred = np.array(x_pred)
-    y_pred = model.predict(x_pred, verbose=0)
-    pred_labels = np.argmax(y_pred, axis=1)
-    
-    # 事件检测参数
+    y_pred = model.predict( x_pred, verbose=0)
+    pred_labels = np.argmax( y_pred, axis=1 )
     last_event_idx = {"HS": -distance, "TO": -distance} 
-    hs_distance_threshold = 30  # HS事件最小间隔
-    to_indices = []  # 储存TO事件索引
+    hs_distance_threshold = 30
+    to_indices = []
     in_to_segment = False
 
-    # 检测TO事件 (模型标签为0)
     for i in range(1, len(pred_labels)):
         if pred_labels[i] == 0 and not in_to_segment:
             start = i
             in_to_segment = True
         elif pred_labels[i] != 0 and in_to_segment:
             end = i - 1
-            if end - start >= 5:  # 最小持续时间
+            if end - start >= 5:
                 seg = test_gyro[start + window_size : end + window_size + 1]
-                local_min_idx = np.argmin(seg)  # 找局部最小值
+                local_min_idx = np.argmin(seg)
                 global_idx = start + window_size + local_min_idx
                 if global_idx - last_event_idx["TO"] >= distance:
                     event_time = test_time[global_idx]
@@ -393,7 +343,6 @@ def predict_events(model, test_time, test_gyro, window_size=60, distance=40):
                     last_event_idx["TO"] = global_idx
             in_to_segment = False
 
-    # 处理最后一个可能未结束的TO段
     if in_to_segment:
         end = len(pred_labels) - 1
         if end - start >= 5:
@@ -405,16 +354,14 @@ def predict_events(model, test_time, test_gyro, window_size=60, distance=40):
                 pred_events.append((event_time, "TO"))
                 to_indices.append(global_idx)
                 last_event_idx["TO"] = global_idx
-
-    # 检测HS事件 (在TO事件之间找局部最大值)
     last_hs_idx = -distance
     for i in range(len(to_indices) - 1):
         start_idx = to_indices[i]
         end_idx = to_indices[i+1]
-        if end_idx - start_idx <= 5:  # 忽略过短区间
+        if end_idx - start_idx <= 5:  
             continue
         seg = test_gyro[start_idx:end_idx+1]
-        local_max_idx = np.argmax(seg)  # 找局部最大值
+        local_max_idx = np.argmax(seg)
         hs_global_idx = start_idx + local_max_idx
         if hs_global_idx - last_hs_idx >= hs_distance_threshold:
             event_time = test_time[hs_global_idx]
@@ -423,183 +370,63 @@ def predict_events(model, test_time, test_gyro, window_size=60, distance=40):
     
     return pred_events
 
-def calculate_gait_phases(pred_events):
-    """直接从预测事件计算站立期和摆动期"""
+@app.post("/predict/")
+async def predict_from_csv(file: UploadFile = File(...)):
     try:
-        # 分离HS和TO事件
-        hs_times = [t for t, e in pred_events if e == "HS"]
-        to_times = [t for t, e in pred_events if e == "TO"]
+        contents = await file.read()
+        df = pd.read_csv(io.BytesIO(contents))
 
-        if len(hs_times) < 2 or len(to_times) < 1:
-            return None
+        # 檢查欄位
+        if "Gyroscope_Z" not in df.columns or "Time" not in df.columns:
+            return JSONResponse(status_code=400, content={"error": "缺少 'Time' 或 'Gyroscope_Z' 欄位"})
 
-        stance_phases = []
-        swing_phases = []
-
-        # 计算每个步态周期的相位
-        for i in range(len(hs_times) - 1):
-            hs1 = hs_times[i]
-            hs2 = hs_times[i + 1]
-            
-            # 找出当前周期内的TO事件
-            cycle_to = [to for to in to_times if hs1 < to < hs2]
-            if not cycle_to:
-                continue
-                
-            to = cycle_to[0]  # 取第一个TO事件
-            gait_cycle = hs2 - hs1
-            stance_duration = to - hs1
-            swing_duration = hs2 - to
-
-            if gait_cycle <= 0:
-                continue
-
-            stance_phases.append(stance_duration / gait_cycle)
-            swing_phases.append(swing_duration / gait_cycle)
-
-        if not stance_phases or not swing_phases:
-            return None
-
-        # 计算平均比例
-        avg_stance = np.mean(stance_phases)
-        avg_swing = np.mean(swing_phases)
-        
-        return {
-            "Stance Phase": float(avg_stance),
-            "Swing Phase": float(avg_swing)
-        }
-    except Exception as e:
-        print(f"计算步态相位错误: {str(e)}")
-        return None
-# 新增的足弓分析函數
-def analyze_foot_arch(model, df):
-    """
-    分析足弓類型
-    返回: (normal_prob, flat_prob)
-    """
-    if model is None:
-        return (0.5, 0.5)  # 默認值
-    
-    try:
-        # 1. 特徵提取
-        features = extract_arch_features(df)
-        
-        # 2. 標準化（假設模型需要標準化數據）
-        # 這裡應該使用與訓練時相同的標準化參數
-        # features = (features - mean_train) / std_train
-        
-        # 3. 預測
-        probs = model.predict(features.reshape(1, -1), verbose=0)[0]
-        normal_prob = float(probs[0])
-        flat_prob = float(probs[1])
-        
-        return (normal_prob, flat_prob)
-    except Exception as e:
-        logger.error(f"足弓分析失敗: {str(e)}")
-        return (0.5, 0.5)  # 失敗時返回中性概率
-
-# 統一的API響應格式
-def create_api_response(gait_result, arch_result, events):
-    """構建標準化API響應"""
-    normal_prob, flat_prob = arch_result
-    return {
-        "gait_analysis": gait_result or {
-            "Stance Phase": 0.6,
-            "Swing Phase": 0.4
-        },
-        "arch_analysis": {
-            "normalProb": normal_prob,
-            "flatProb": flat_prob,
-            "diagnosis": "normal" if normal_prob > 0.5 else "flat"
-        },
-        "events": [{"time": float(t), "event": e} for t, e in events],
-        "status": "success",
-        "message": "分析完成"
-    }
-
-# 文件上傳端點（主要修改部分）
-@app.route("/predict", methods=["POST"])
-def predict():
-    # 基本檢查
-    if gait_model is None or arch_model is None:
-        return jsonify({
-            "status": "error",
-            "message": "服務器模型未加載"
-        }), 500
-    
-    if "file" not in request.files:
-        return jsonify({
-            "status": "error",
-            "message": "未上傳文件"
-        }), 400
-    
-    file = request.files["file"]
-    if file.filename == "":
-        return jsonify({
-            "status": "error",
-            "message": "空文件名"
-        }), 400
-    
-    # 只接受CSV文件
-    if not (file and file.filename.endswith(".csv")):
-        return jsonify({
-            "status": "error",
-            "message": "僅支持CSV文件"
-        }), 400
-    
-    try:
-        # 1. 讀取CSV數據
-        df = pd.read_csv(file)
-        logger.info(f"成功讀取CSV，行數: {len(df)}")
-        
-        # 2. 檢查必要欄位
-        required_columns = ["Time", "Gyroscope_Z", 
-                          "Acceleration_X", "Acceleration_Y", "Acceleration_Z"]
-        missing_cols = [col for col in required_columns if col not in df.columns]
-        
-        if missing_cols:
-            return jsonify({
-                "status": "error",
-                "message": f"CSV缺少必要欄位: {', '.join(missing_cols)}"
-            }), 400
-        
-        # 3. 步態分析
         test_time = df["Time"].values
         test_gyro = df["Gyroscope_Z"].values
-        
-        pred_events = predict_events(gait_model, test_time, test_gyro)
-        gait_result = calculate_gait_phases(pred_events)
-        
-        # 4. 足弓分析（新增）
-        arch_result = analyze_foot_arch(arch_model, df)
-        
-        # 5. 構建響應
-        response = create_api_response(gait_result, arch_result, pred_events)
-        logger.info("分析成功完成")
-        
-        return jsonify(response)
-        
+
+        # 預測
+        results = predict(model, test_time, test_gyro)
+
+        return {"status": "success", "predictions": [{"time": t, "event": e} for t, e in results]}
     except Exception as e:
-        logger.error(f"處理失敗: {str(e)}", exc_info=True)
-        return jsonify({
-            "status": "error",
-            "message": f"服務器錯誤: {str(e)}"
-        }), 500
-
-# 健康檢查端點
-@app.route("/health", methods=["GET"])
-def health_check():
-    return jsonify({
-        "status": "healthy",
-        "models_loaded": {
-            "gait_model": gait_model is not None,
-            "arch_model": arch_model is not None
+        return JSONResponse(status_code=500, content={"error": str(e)})
+# 新增API端點
+@app.post("/analyze_flatfoot/")
+async def analyze_flatfoot(file: UploadFile = File(...)):
+    try:
+        # 1. 讀取CSV（與現有HS/TO預測相同格式）
+        contents = await file.read()
+        df = pd.read_csv(io.BytesIO(contents))
+        
+        # 2. 調用您的預訓練模型（替換為實際模型調用）
+        prob = 0.65  # 假設值，替換為 model.predict(df)
+        diagnosis = "高風險" if prob >= 0.6 else "正常"
+        
+        # 3. 儲存結果到資料庫
+        conn = sqlite3.connect('gait_results.db')
+        c = conn.cursor()
+        c.execute("INSERT INTO flatfoot_results VALUES (?,?,?,?)",
+                 (datetime.now().isoformat(), prob, diagnosis, "current_user"))
+        conn.commit()
+        conn.close()
+        
+        return {
+            "status": "success",
+            "probability": prob,
+            "diagnosis": diagnosis,
+            "timestamp": datetime.now().isoformat()
         }
-    })
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+# 新增結果查詢端點
+@app.get("/get_flatfoot_results/")
+async def get_results(user_id: str = "current_user"):
+    conn = sqlite3.connect('gait_results.db')
+    c = conn.cursor()
+    c.execute("SELECT * FROM flatfoot_results WHERE user_id=? ORDER BY timestamp DESC", (user_id,))
+    results = [{"timestamp": r[0], "probability": r[1], "diagnosis": r[2]} for r in c.fetchall()]
+    conn.close()
+    return {"status": "success", "results": results}
 
 
 # import os  # 新增：必须导入 os 模块
