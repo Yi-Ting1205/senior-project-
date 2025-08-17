@@ -428,6 +428,11 @@ async def get_results(user_id: str = "current_user"):
     conn.close()
     return {"status": "success", "results": results}
 
+# 在檔案結尾修改啟動代碼
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))  # Render 會自動注入 $PORT
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
 # import os  # 新增：必须导入 os 模块
 # from flask import Flask, request, jsonify
