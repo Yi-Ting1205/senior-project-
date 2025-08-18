@@ -281,30 +281,24 @@
 # if __name__ == "__main__":
 #     port = int(os.environ.get("PORT", 8000))
 #     app.run(host="0.0.0.0", port=port, debug=False)
-from fastapi.middleware.cors import CORSMiddleware
-from tensorflow.keras.models import load_model
-from fastapi import FastAPI, UploadFile, File
+
+
+from fastapi import FastAPI, Body
 from fastapi.responses import JSONResponse
-import pandas as pd
+from tensorflow.keras.models import load_model
 import numpy as np
-import io
-from datetime import datetime
 import sqlite3
-import os
+from datetime import datetime
 import tensorflow as tf
 
-app = FastAPI()  # 啟動 FastAPI 應用
+app = FastAPI()
+tf.config.set_visible_devices([], 'GPU')  # 禁用 GPU
 
-# 禁用 GPU 加速（Render 免費版沒有 GPU）
-tf.config.set_visible_devices([], 'GPU')
+# 載入 HS/TO 與 V02 模型
+hs_to_model = load_model("gait_model_5.h5")
+v02_model = load_model("V02_Infer.keras", compile=False)
 
-
-@app.get("/")
-def read_root():
-    return {"status": "API is running"}
-
-
-# 初始化資料庫（只需執行一次）
+# 初始化資料庫
 def init_db():
     conn = sqlite3.connect('gait_results.db')
     c = conn.cursor()
@@ -313,20 +307,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-
-init_db()  # 確保資料庫表已建立
-
-# 加入 CORS 中介軟體
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# 載入模型（確保 gait_model_5.h5 檔案存在）
-model = load_model("gait_model_5.h5")
+init_db()
 
 
 # === 預測邏輯 ===
@@ -392,54 +373,91 @@ def predict(model, test_time, test_gyro, window_size=60, distance=40):
 
     return pred_events
 
+# 將 IMU 與 Pred_result 生成 PAA + 5-step 視窗
+def build_v02_windows(data, pred_result):
+    FEAT_COLS = ["gx", "gy", "gz", "ax", "ay", "az"]
+    EVENT_COL = "Pred_result"
+    PAA_IDX = 100
+    WIN_STEPS = 5
+    STRIDE_PAA_WIN = 2
 
-# === API 端點 ===
-@app.post("/predict/")
-async def predict_from_csv(file: UploadFile = File(...)):
+    # 生成 step PAA
+    df = data.copy()
+    df["Pred_result"] = pred_result
+    ev = np.array([str(e).upper() for e in df["Pred_result"]])
+    to_idx = np.where(ev == "TO")[0]
+
+    paa_list = []
+    for i in range(len(to_idx) - 1):
+        a, b = int(to_idx[i]), int(to_idx[i+1])
+        if b <= a: continue
+        step = df[FEAT_COLS].iloc[a:b].to_numpy(dtype=np.float32)
+        # PAA
+        L, F = step.shape
+        idx = (np.linspace(0, L, PAA_IDX+1)).astype(int)
+        out = np.add.reduceat(step, idx[:-1], axis=0)
+        w = np.maximum(np.diff(idx)[:, None], 1)
+        paa_list.append(out / w)
+
+    # 五步視窗
+    seqs = []
+    for s in range(0, len(paa_list) - WIN_STEPS + 1, STRIDE_PAA_WIN):
+        seq = np.concatenate(paa_list[s:s+WIN_STEPS], axis=0)
+        seqs.append(seq.astype(np.float32))
+
+    if seqs:
+        return np.stack(seqs, axis=0)
+    else:
+        return np.empty((0, WIN_STEPS*PAA_IDX, len(FEAT_COLS)), dtype=np.float32)
+
+
+# 主 API
+@app.post("/analyze_flatfoot_json/")
+async def analyze_flatfoot_json(data: list = Body(...)):
     try:
-        contents = await file.read()
-        df = pd.read_csv(io.BytesIO(contents))
+        # 轉成 numpy / DataFrame
+        import pandas as pd
+        df = pd.DataFrame(data)
+        gx = df["gx"].to_numpy()
+        gz = df["gz"].to_numpy()
+        times = df["time"].to_numpy()
 
-        # 檢查欄位
-        if "Gyroscope_Z" not in df.columns or "Time" not in df.columns:
-            return JSONResponse(status_code=400, content={"error": "缺少 'Time' 或 'Gyroscope_Z' 欄位"})
+        # HS/TO 推論
+        hs_to_events = predict_hs_to(gz, times)
 
-        test_time = df["Time"].values
-        test_gyro = df["Gyroscope_Z"].values
+        # 建立 Pred_result 陣列對應每筆數據
+        pred_result = [""]*len(df)
+        for e in hs_to_events:
+            # 將時間對應到最近索引，標記 HS 或 TO
+            idx = (np.abs(df["time"] - e["time"])).argmin()
+            pred_result[idx] = e["event"]
 
-        # 預測
-        results = predict(model, test_time, test_gyro)
+        # 生成 V02 視窗
+        X_seq = build_v02_windows(df, pred_result)
 
-        return {"status": "success", "predictions": [{"time": t, "event": e} for t, e in results]}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        # V02 模型推論
+        if X_seq.shape[0] > 0:
+            probs = v02_model.predict(X_seq, verbose=0)
+            pred_class = np.argmax(probs, axis=1)
+            prob_flat = float(probs[:,1].mean())
+        else:
+            prob_flat = 0.0
 
+        diagnosis = "高風險" if prob_flat >= 0.6 else "正常"
 
-@app.post("/analyze_flatfoot/")
-async def analyze_flatfoot(file: UploadFile = File(...)):
-    try:
-        # 1. 讀取 CSV
-        contents = await file.read()
-        df = pd.read_csv(io.BytesIO(contents))
-
-        # 2. 模型推論（這裡用假數值，實際請替換）
-        prob = 0.65
-        diagnosis = "高風險" if prob >= 0.6 else "正常"
-
-        # 3. 儲存結果到資料庫
+        # 儲存資料庫
         conn = sqlite3.connect('gait_results.db')
         c = conn.cursor()
         c.execute("INSERT INTO flatfoot_results VALUES (?,?,?,?)",
-                  (datetime.now().isoformat(), prob, diagnosis, "current_user"))
+                  (datetime.now().isoformat(), prob_flat, diagnosis, "current_user"))
         conn.commit()
         conn.close()
 
-        return {
-            "status": "success",
-            "probability": prob,
-            "diagnosis": diagnosis,
-            "timestamp": datetime.now().isoformat()
-        }
+        return {"status": "success",
+                "hs_to_events": hs_to_events,
+                "probability": prob_flat,
+                "diagnosis": diagnosis}
+
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
@@ -465,6 +483,193 @@ if __name__ == "__main__":
         workers=1,  # Render 免費版只支援單 worker
         timeout_keep_alive=60
     )
+
+
+＃成功但沒有用到v02
+# from fastapi.middleware.cors import CORSMiddleware
+# from tensorflow.keras.models import load_model
+# from fastapi import FastAPI, UploadFile, File
+# from fastapi.responses import JSONResponse
+# import pandas as pd
+# import numpy as np
+# import io
+# from datetime import datetime
+# import sqlite3
+# import os
+# import tensorflow as tf
+
+# app = FastAPI()  # 啟動 FastAPI 應用
+
+# # 禁用 GPU 加速（Render 免費版沒有 GPU）
+# tf.config.set_visible_devices([], 'GPU')
+
+
+# @app.get("/")
+# def read_root():
+#     return {"status": "API is running"}
+
+
+# # 初始化資料庫（只需執行一次）
+# def init_db():
+#     conn = sqlite3.connect('gait_results.db')
+#     c = conn.cursor()
+#     c.execute('''CREATE TABLE IF NOT EXISTS flatfoot_results
+#                  (timestamp TEXT, probability REAL, diagnosis TEXT, user_id TEXT)''')
+#     conn.commit()
+#     conn.close()
+
+
+# init_db()  # 確保資料庫表已建立
+
+# # 加入 CORS 中介軟體
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=["*"],
+#     allow_credentials=True,
+#     allow_methods=["*"],
+#     allow_headers=["*"],
+# )
+
+# # 載入模型（確保 gait_model_5.h5 檔案存在）
+# model = load_model("gait_model_5.h5")
+
+
+# # === 預測邏輯 ===
+# def predict(model, test_time, test_gyro, window_size=60, distance=40):
+#     x_pred = []
+#     pred_events = []
+
+#     for i in range(window_size, len(test_gyro) - window_size):
+#         window = test_gyro[i - window_size: i + window_size + 1].reshape(-1, 1)
+#         x_pred.append(window)
+
+#     x_pred = np.array(x_pred)
+#     y_pred = model.predict(x_pred, verbose=0)
+#     pred_labels = np.argmax(y_pred, axis=1)
+
+#     last_event_idx = {"HS": -distance, "TO": -distance}
+#     hs_distance_threshold = 30
+#     to_indices = []
+#     in_to_segment = False
+
+#     for i in range(1, len(pred_labels)):
+#         if pred_labels[i] == 0 and not in_to_segment:
+#             start = i
+#             in_to_segment = True
+#         elif pred_labels[i] != 0 and in_to_segment:
+#             end = i - 1
+#             if end - start >= 5:
+#                 seg = test_gyro[start + window_size: end + window_size + 1]
+#                 local_min_idx = np.argmin(seg)
+#                 global_idx = start + window_size + local_min_idx
+#                 if global_idx - last_event_idx["TO"] >= distance:
+#                     event_time = test_time[global_idx]
+#                     pred_events.append((event_time, "TO"))
+#                     to_indices.append(global_idx)
+#                     last_event_idx["TO"] = global_idx
+#             in_to_segment = False
+
+#     if in_to_segment:
+#         end = len(pred_labels) - 1
+#         if end - start >= 5:
+#             seg = test_gyro[start + window_size: end + window_size + 1]
+#             local_min_idx = np.argmin(seg)
+#             global_idx = start + window_size + local_min_idx
+#             if global_idx - last_event_idx["TO"] >= distance:
+#                 event_time = test_time[global_idx]
+#                 pred_events.append((event_time, "TO"))
+#                 to_indices.append(global_idx)
+#                 last_event_idx["TO"] = global_idx
+
+#     last_hs_idx = -distance
+#     for i in range(len(to_indices) - 1):
+#         start_idx = to_indices[i]
+#         end_idx = to_indices[i + 1]
+#         if end_idx - start_idx <= 5:
+#             continue
+#         seg = test_gyro[start_idx:end_idx + 1]
+#         local_max_idx = np.argmax(seg)
+#         hs_global_idx = start_idx + local_max_idx
+#         if hs_global_idx - last_hs_idx >= hs_distance_threshold:
+#             event_time = test_time[hs_global_idx]
+#             pred_events.append((event_time, "HS"))
+#             last_hs_idx = hs_global_idx
+
+#     return pred_events
+
+
+# # === API 端點 ===
+# @app.post("/predict/")
+# async def predict_from_csv(file: UploadFile = File(...)):
+#     try:
+#         contents = await file.read()
+#         df = pd.read_csv(io.BytesIO(contents))
+
+#         # 檢查欄位
+#         if "Gyroscope_Z" not in df.columns or "Time" not in df.columns:
+#             return JSONResponse(status_code=400, content={"error": "缺少 'Time' 或 'Gyroscope_Z' 欄位"})
+
+#         test_time = df["Time"].values
+#         test_gyro = df["Gyroscope_Z"].values
+
+#         # 預測
+#         results = predict(model, test_time, test_gyro)
+
+#         return {"status": "success", "predictions": [{"time": t, "event": e} for t, e in results]}
+#     except Exception as e:
+#         return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+# @app.post("/analyze_flatfoot/")
+# async def analyze_flatfoot(file: UploadFile = File(...)):
+#     try:
+#         # 1. 讀取 CSV
+#         contents = await file.read()
+#         df = pd.read_csv(io.BytesIO(contents))
+
+#         # 2. 模型推論（這裡用假數值，實際請替換）
+#         prob = 0.65
+#         diagnosis = "高風險" if prob >= 0.6 else "正常"
+
+#         # 3. 儲存結果到資料庫
+#         conn = sqlite3.connect('gait_results.db')
+#         c = conn.cursor()
+#         c.execute("INSERT INTO flatfoot_results VALUES (?,?,?,?)",
+#                   (datetime.now().isoformat(), prob, diagnosis, "current_user"))
+#         conn.commit()
+#         conn.close()
+
+#         return {
+#             "status": "success",
+#             "probability": prob,
+#             "diagnosis": diagnosis,
+#             "timestamp": datetime.now().isoformat()
+#         }
+#     except Exception as e:
+#         return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+# @app.get("/get_flatfoot_results/")
+# async def get_results(user_id: str = "current_user"):
+#     conn = sqlite3.connect('gait_results.db')
+#     c = conn.cursor()
+#     c.execute("SELECT * FROM flatfoot_results WHERE user_id=? ORDER BY timestamp DESC", (user_id,))
+#     results = [{"timestamp": r[0], "probability": r[1], "diagnosis": r[2]} for r in c.fetchall()]
+#     conn.close()
+#     return {"status": "success", "results": results}
+
+
+# # === 啟動程式 ===
+# if __name__ == "__main__":
+#     import uvicorn
+#     port = int(os.environ.get("PORT", 8000))
+#     uvicorn.run(
+#         "Server:app",  # 注意這裡 S 要大寫，跟檔案名一致
+#         host="0.0.0.0",
+#         port=port,
+#         workers=1,  # Render 免費版只支援單 worker
+#         timeout_keep_alive=60
+#     )
 
 # import os  # 新增：必须导入 os 模块
 # from flask import Flask, request, jsonify
