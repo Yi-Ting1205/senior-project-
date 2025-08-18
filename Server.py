@@ -485,7 +485,7 @@ if __name__ == "__main__":
     )
 
 
-＃成功但沒有用到v02
+# 成功但沒有用到v02
 # from fastapi.middleware.cors import CORSMiddleware
 # from tensorflow.keras.models import load_model
 # from fastapi import FastAPI, UploadFile, File
