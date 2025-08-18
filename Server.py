@@ -294,6 +294,7 @@ import sqlite3
 import os  # 必须导入
 from fastapi import FastAPI
 import tensorflow as tf
+app = FastAPI()  # 关键位置！
 
 # 禁用GPU加速
 tf.config.set_visible_devices([], 'GPU')
@@ -310,7 +311,6 @@ def init_db():
     conn.commit()
     conn.close()
 
-app = FastAPI()
 init_db()  # 确保数据库表已创建
 app.add_middleware(
     CORSMiddleware,
