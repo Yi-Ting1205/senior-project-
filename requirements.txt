@@ -1,7 +1,4 @@
 
-# 基礎環境
-Python==3.10
-
 # Web 相關
 Flask==2.3.2
 fastapi==0.110.0
