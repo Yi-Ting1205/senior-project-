@@ -1,19 +1,13 @@
-# Web
 Flask==2.3.2
-fastapi==0.110.0
-uvicorn==0.29.0
+pandas>=2.1.0
 gunicorn==20.1.0
-python-multipart==0.0.9
-
-# Data Processing
-numpy==1.24.3
-pandas==2.2.2
-scikit-learn==1.5.0
-pyyaml==6.0.1
-matplotlib==3.8.4
-
-# ML/TensorFlow
 tensorflow==2.16.2
-h5py==3.10.0
-tensorflow-io-gcs-filesystem==0.34.0
-protobuf==4.25.8
+python-multipart
+fastapi
+uvicorn
+numpy
+pandas
+scikit-learn
+matplotlib
+pyyaml
+h5py
