@@ -1,18 +1,5 @@
-＃Flask==2.3.2
-#pandas>=2.1.0
-#gunicorn==20.1.0
-#tensorflow==2.16.2
-#python-multipart
-#fastapi
-#uvicorn
-#numpy
-#pandas
-#scikit-learn
-#matplotlib
-#pyyaml
-#h5py
 
-Flask==2.3.3
+Flask==2.3.2
 tensorflow==2.12.1
 keras==2.12.0
 numpy==1.24.3
