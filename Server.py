@@ -283,262 +283,24 @@
 #     app.run(host="0.0.0.0", port=port, debug=False)
 # -*- coding: utf-8 -*-
 
-from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
-import numpy as np
-import pandas as pd
-import tensorflow as tf
-from datetime import datetime
-import json
-import io
-import os
-
-# 禁用 GPU，節省 Render 記憶體
-tf.config.set_visible_devices([], 'GPU')
-
-app = FastAPI(title="Gait Analysis API", version="1.0.0")
-
-# CORS 中間件
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# 請求數據模型
-class SensorData(BaseModel):
-    timestamp: Optional[List[float]] = None
-    acceleration_x: List[float]
-    acceleration_y: List[float]
-    acceleration_z: List[float]
-    gyroscope_x: List[float]
-    gyroscope_y: List[float]
-    gyroscope_z: List[float]
-
-# 載入模型函數
-def load_gait_model():
-    try:
-        # 這裡模擬模型載入，您需要替換為實際的模型載入邏輯
-        print("Gait model loaded successfully")
-        return "model_loaded"
-    except Exception as e:
-        print(f"模型載入失敗: {e}")
-        return None
-
-# 全局模型變數
-gait_model = load_gait_model()
-
-@app.get("/")
-async def root():
-    return {
-        "message": "Gait Analysis API", 
-        "version": "1.0.0",
-        "status": "ready",
-        "endpoints": {
-            "health": "/health",
-            "sensor_predict": "/predict (POST)",
-            "csv_predict": "/predict_csv (POST)"
-        }
-    }
-
-@app.get("/health")
-async def health():
-    return {
-        "status": "healthy", 
-        "timestamp": datetime.now().isoformat(),
-        "model_loaded": gait_model is not None,
-        "python_version": os.environ.get("PYTHON_VERSION", "3.10.0")
-    }
-
-@app.post("/predict")
-async def predict_from_sensor(sensor_data: SensorData):
-    try:
-        if gait_model is None:
-            raise HTTPException(status_code=500, detail="Model not loaded")
-        
-        # 轉換為字典以便處理
-        data_dict = sensor_data.dict()
-        
-        # 檢查數據長度
-        min_length = 50  # 最小數據點數
-        for key, value in data_dict.items():
-            if isinstance(value, list) and len(value) < min_length:
-                raise HTTPException(
-                    status_code=400, 
-                    detail=f"Field {key} has insufficient data (min {min_length} points required, got {len(value)})"
-                )
-        
-        # 這裡加入您的預測邏輯
-        predictions = simulate_gait_prediction(data_dict)
-        
-        return {
-            "status": "success",
-            "predictions": predictions,
-            "summary": {
-                "total_predictions": len(predictions),
-                "normal_count": sum(1 for p in predictions if p.get("prediction") == 0),
-                "flat_count": sum(1 for p in predictions if p.get("prediction") == 1),
-                "confidence_avg": sum(p.get("confidence", 0) for p in predictions) / len(predictions) if predictions else 0,
-                "processed_at": datetime.now().isoformat()
-            },
-            "data_stats": {
-                "total_samples": len(data_dict['gyroscope_z']),
-                "duration_seconds": calculate_duration(data_dict),
-                "sample_rate": calculate_sample_rate(data_dict)
-            }
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
-
-def simulate_gait_prediction(data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """模擬步態預測函數"""
-    gyro_z = data.get('gyroscope_z', [])
-    if not gyro_z:
-        return []
-    
-    # 簡單的模擬邏輯 - 檢測峰值作為事件
-    predictions = []
-    n_samples = len(gyro_z)
-    
-    # 檢測可能的步態事件
-    for i in range(1, min(n_samples, 200) - 1):
-        if abs(gyro_z[i]) > 1.0:  # 閾值檢測
-            is_peak = (gyro_z[i] > gyro_z[i-1] and gyro_z[i] > gyro_z[i+1])
-            is_valley = (gyro_z[i] < gyro_z[i-1] and gyro_z[i] < gyro_z[i+1])
-            
-            if is_peak or is_valley:
-                event_type = "HS" if is_peak else "TO"
-                confidence = min(abs(gyro_z[i]) / 5.0, 1.0)  # 正規化信度
-                
-                predictions.append({
-                    "time": data.get('timestamp', [0] * n_samples)[i] if data.get('timestamp') else i * 0.016,
-                    "event": event_type,
-                    "confidence": round(confidence, 3),
-                    "gyro_value": round(gyro_z[i], 3),
-                    "index": i
-                })
-    
-    return predictions[:10]  # 返回前10個預測
-
-def calculate_duration(data: Dict[str, Any]) -> float:
-    """計算數據持續時間"""
-    timestamps = data.get('timestamp')
-    if timestamps and len(timestamps) > 1:
-        return round(timestamps[-1] - timestamps[0], 2)
-    return round(len(data.get('gyroscope_z', [])) * 0.016, 2)
-
-def calculate_sample_rate(data: Dict[str, Any]) -> float:
-    """計算採樣率"""
-    timestamps = data.get('timestamp')
-    if timestamps and len(timestamps) > 1:
-        duration = timestamps[-1] - timestamps[0]
-        if duration > 0:
-            return round(len(timestamps) / duration, 1)
-    return 60.0  # 預設 60Hz
-
-@app.post("/predict_csv")
-async def predict_from_csv(file: UploadFile = File(...)):
-    try:
-        if gait_model is None:
-            raise HTTPException(status_code=500, detail="Model not loaded")
-        
-        # 讀取 CSV 內容
-        contents = await file.read()
-        df = pd.read_csv(io.BytesIO(contents))
-        
-        # 檢查必要欄位
-        required_columns = ['Gyroscope_Z']
-        missing_columns = [col for col in required_columns if col not in df.columns]
-        if missing_columns:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Missing required columns: {missing_columns}. Available columns: {list(df.columns)}"
-            )
-        
-        # 模擬 CSV 處理
-        gyro_z = df['Gyroscope_Z'].values
-        time_col = df['Time'].values if 'Time' in df.columns else np.arange(len(gyro_z)) * 0.016
-        
-        # 模擬預測
-        predictions = []
-        for i in range(1, min(len(gyro_z), 100) - 1):
-            if abs(gyro_z[i]) > 0.8:
-                is_peak = (gyro_z[i] > gyro_z[i-1] and gyro_z[i] > gyro_z[i+1])
-                is_valley = (gyro_z[i] < gyro_z[i-1] and gyro_z[i] < gyro_z[i+1])
-                
-                if is_peak or is_valley:
-                    event_type = "HS" if is_peak else "TO"
-                    predictions.append({
-                        "time": float(time_col[i]),
-                        "event": event_type,
-                        "value": float(gyro_z[i]),
-                        "index": i
-                    })
-        
-        return {
-            "status": "success",
-            "filename": file.filename,
-            "rows_processed": len(df),
-            "predictions": predictions[:15],  # 返回前15個預測
-            "columns": list(df.columns),
-            "processed_at": datetime.now().isoformat()
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"CSV processing error: {str(e)}")
-
-@app.post("/debug_sensor")
-async def debug_sensor_data(sensor_data: SensorData):
-    """調試端點：返回接收到的感測器數據信息"""
-    data_dict = sensor_data.dict()
-    
-    stats = {}
-    for key, value in data_dict.items():
-        if isinstance(value, list):
-            stats[key] = {
-                "count": len(value),
-                "first_5": value[:5] if value else [],
-                "min": min(value) if value else None,
-                "max": max(value) if value else None,
-                "mean": sum(value) / len(value) if value else None
-            }
-    
-    return {
-        "status": "debug",
-        "data_stats": stats,
-        "received_at": datetime.now().isoformat()
-    }
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    print(f"Starting server on port {port}")
-    uvicorn.run(app, host="0.0.0.0", port=port)
-
-# from fastapi import FastAPI, UploadFile, File
-# from fastapi.responses import JSONResponse
+# from fastapi import FastAPI, HTTPException, UploadFile, File
 # from fastapi.middleware.cors import CORSMiddleware
-# from tensorflow.keras.models import load_model
-# import tensorflow as tf
+# from pydantic import BaseModel
+# from typing import List, Dict, Any, Optional
 # import numpy as np
+# import pandas as pd
+# import tensorflow as tf
 # from datetime import datetime
-# import sqlite3
+# import json
 # import io
 # import os
 
-# app = FastAPI()
-
-# # 禁用 GPU（Render 免費版）
+# # 禁用 GPU，節省 Render 記憶體
 # tf.config.set_visible_devices([], 'GPU')
 
-# # --- CORS ---
+# app = FastAPI(title="Gait Analysis API", version="1.0.0")
+
+# # CORS 中間件
 # app.add_middleware(
 #     CORSMiddleware,
 #     allow_origins=["*"],
@@ -547,179 +309,417 @@ if __name__ == "__main__":
 #     allow_headers=["*"],
 # )
 
-# # --- 初始化資料庫 ---
-# def init_db():
-#     conn = sqlite3.connect('gait_results.db')
-#     c = conn.cursor()
-#     c.execute('''CREATE TABLE IF NOT EXISTS flatfoot_results
-#                  (timestamp TEXT, probability REAL, diagnosis TEXT, user_id TEXT)''')
-#     conn.commit()
-#     conn.close()
+# # 請求數據模型
+# class SensorData(BaseModel):
+#     timestamp: Optional[List[float]] = None
+#     acceleration_x: List[float]
+#     acceleration_y: List[float]
+#     acceleration_z: List[float]
+#     gyroscope_x: List[float]
+#     gyroscope_y: List[float]
+#     gyroscope_z: List[float]
 
-# init_db()
-
-# # --- 載入 V02 模型 ---
-# v02_model_path = "V02_Infer.keras"
-# if os.path.exists(v02_model_path):
+# # 載入模型函數
+# def load_gait_model():
 #     try:
-#         v02_model = load_model(v02_model_path, compile=False)
-#         print(f"✅ 成功載入 V02 模型: {v02_model_path}")
+#         # 這裡模擬模型載入，您需要替換為實際的模型載入邏輯
+#         print("Gait model loaded successfully")
+#         return "model_loaded"
 #     except Exception as e:
-#         print(f"❌ 載入 V02 模型時發生錯誤: {e}")
-#         v02_model = None
-# else:
-#     print(f"❌ 找不到 V02 模型檔案: {v02_model_path}")
-#     v02_model = None
+#         print(f"模型載入失敗: {e}")
+#         return None
 
-# # --- API 根目錄 ---
+# # 全局模型變數
+# gait_model = load_gait_model()
+
 # @app.get("/")
-# def read_root():
-#     return {"status": "API is running"}
-
-# # --- 預測 HS/TO (dummy 範例) ---
-# def predict(model, test_time, test_gyro, window_size=60, distance=40):
-#     x_pred = []
-#     pred_events = []
-
-#     for i in range(window_size, len(test_gyro) - window_size):
-#         window = test_gyro[i - window_size: i + window_size + 1].reshape(-1, 1)
-#         x_pred.append(window)
-
-#     x_pred = np.array(x_pred)
-#     y_pred = model.predict(x_pred, verbose=0)
-#     pred_labels = np.argmax(y_pred, axis=1)
-
-#     last_event_idx = {"HS": -distance, "TO": -distance}
-#     hs_distance_threshold = 30
-#     to_indices = []
-#     in_to_segment = False
-
-#     for i in range(1, len(pred_labels)):
-#         if pred_labels[i] == 0 and not in_to_segment:
-#             start = i
-#             in_to_segment = True
-#         elif pred_labels[i] != 0 and in_to_segment:
-#             end = i - 1
-#             if end - start >= 5:
-#                 seg = test_gyro[start + window_size: end + window_size + 1]
-#                 local_min_idx = np.argmin(seg)
-#                 global_idx = start + window_size + local_min_idx
-#                 if global_idx - last_event_idx["TO"] >= distance:
-#                     event_time = test_time[global_idx]
-#                     pred_events.append((event_time, "TO"))
-#                     to_indices.append(global_idx)
-#                     last_event_idx["TO"] = global_idx
-#             in_to_segment = False
-
-#     if in_to_segment:
-#         end = len(pred_labels) - 1
-#         if end - start >= 5:
-#             seg = test_gyro[start + window_size: end + window_size + 1]
-#             local_min_idx = np.argmin(seg)
-#             global_idx = start + window_size + local_min_idx
-#             if global_idx - last_event_idx["TO"] >= distance:
-#                 event_time = test_time[global_idx]
-#                 pred_events.append((event_time, "TO"))
-#                 to_indices.append(global_idx)
-#                 last_event_idx["TO"] = global_idx
-
-#     last_hs_idx = -distance
-#     for i in range(len(to_indices) - 1):
-#         start_idx = to_indices[i]
-#         end_idx = to_indices[i + 1]
-#         if end_idx - start_idx <= 5:
-#             continue
-#         seg = test_gyro[start_idx:end_idx + 1]
-#         local_max_idx = np.argmax(seg)
-#         hs_global_idx = start_idx + local_max_idx
-#         if hs_global_idx - last_hs_idx >= hs_distance_threshold:
-#             event_time = test_time[hs_global_idx]
-#             pred_events.append((event_time, "HS"))
-#             last_hs_idx = hs_global_idx
-
-#     return pred_events
-
-
-# # --- API: 上傳 JSON 分析 ---
-# @app.post("/analyze_flatfoot/")
-# async def analyze_flatfoot(data: dict):
-#     """
-#     JSON 格式:
-#     {
-#         "Gyroscope_X": [...],
-#         "Gyroscope_Y": [...],
-#         "Gyroscope_Z": [...],
-#         "Acceleration_X": [...],
-#         "Acceleration_Y": [...],
-#         "Acceleration_Z": [...]
+# async def root():
+#     return {
+#         "message": "Gait Analysis API", 
+#         "version": "1.0.0",
+#         "status": "ready",
+#         "endpoints": {
+#             "health": "/health",
+#             "sensor_predict": "/predict (POST)",
+#             "csv_predict": "/predict_csv (POST)"
+#         }
 #     }
-#     """
+
+# @app.get("/health")
+# async def health():
+#     return {
+#         "status": "healthy", 
+#         "timestamp": datetime.now().isoformat(),
+#         "model_loaded": gait_model is not None,
+#         "python_version": os.environ.get("PYTHON_VERSION", "3.10.0")
+#     }
+
+# @app.post("/predict")
+# async def predict_from_sensor(sensor_data: SensorData):
 #     try:
-#         # 1. 讀 JSON
-#         required_cols = ["Gyroscope_X","Gyroscope_Y","Gyroscope_Z",
-#                          "Acceleration_X","Acceleration_Y","Acceleration_Z"]
-#         for col in required_cols:
-#             if col not in data:
-#                 return JSONResponse(status_code=400, content={"error": f"缺少欄位: {col}"})
-
-#         gx = np.array(data["Gyroscope_X"], dtype=np.float32)
-#         gy = np.array(data["Gyroscope_Y"], dtype=np.float32)
-#         gz = np.array(data["Gyroscope_Z"], dtype=np.float32)
-#         ax = np.array(data["Acceleration_X"], dtype=np.float32)
-#         ay = np.array(data["Acceleration_Y"], dtype=np.float32)
-#         az = np.array(data["Acceleration_Z"], dtype=np.float32)
-
-#         # 2. HS/TO 推論
-#         hs_to_events = predict_hs_to(gz)
-
-#         # 3. V02 模型分析
-#         if v02_model is not None:
-#             # 將六軸數據做簡單堆疊 (N,6)
-#             features = np.stack([gx, gy, gz, ax, ay, az], axis=1)
-#             # 模型輸入: (1,N,6) 假設 V02 可以接受整段序列
-#             X_input = features[None, ...]
-#             probs = v02_model.predict(X_input, verbose=0)  # (1,2)
-#             prob_flat = float(probs[0,1])
-#             diagnosis = "高風險" if prob_flat >= 0.6 else "正常"
-#         else:
-#             prob_flat = None
-#             diagnosis = "模型未載入"
-
-#         # 4. 存入資料庫
-#         conn = sqlite3.connect('gait_results.db')
-#         c = conn.cursor()
-#         c.execute("INSERT INTO flatfoot_results VALUES (?,?,?,?)",
-#                   (datetime.now().isoformat(), prob_flat, diagnosis, "current_user"))
-#         conn.commit()
-#         conn.close()
-
-#         # 5. 回傳結果
+#         if gait_model is None:
+#             raise HTTPException(status_code=500, detail="Model not loaded")
+        
+#         # 轉換為字典以便處理
+#         data_dict = sensor_data.dict()
+        
+#         # 檢查數據長度
+#         min_length = 50  # 最小數據點數
+#         for key, value in data_dict.items():
+#             if isinstance(value, list) and len(value) < min_length:
+#                 raise HTTPException(
+#                     status_code=400, 
+#                     detail=f"Field {key} has insufficient data (min {min_length} points required, got {len(value)})"
+#                 )
+        
+#         # 這裡加入您的預測邏輯
+#         predictions = simulate_gait_prediction(data_dict)
+        
 #         return {
 #             "status": "success",
-#             "hs_to_events": [{"idx": i, "event": e} for i,e in hs_to_events],
-#             "probability": prob_flat,
-#             "diagnosis": diagnosis,
-#             "timestamp": datetime.now().isoformat()
+#             "predictions": predictions,
+#             "summary": {
+#                 "total_predictions": len(predictions),
+#                 "normal_count": sum(1 for p in predictions if p.get("prediction") == 0),
+#                 "flat_count": sum(1 for p in predictions if p.get("prediction") == 1),
+#                 "confidence_avg": sum(p.get("confidence", 0) for p in predictions) / len(predictions) if predictions else 0,
+#                 "processed_at": datetime.now().isoformat()
+#             },
+#             "data_stats": {
+#                 "total_samples": len(data_dict['gyroscope_z']),
+#                 "duration_seconds": calculate_duration(data_dict),
+#                 "sample_rate": calculate_sample_rate(data_dict)
+#             }
 #         }
-
+        
+#     except HTTPException:
+#         raise
 #     except Exception as e:
-#         return JSONResponse(status_code=500, content={"error": str(e)})
+#         raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
 
-# # --- API: 取得歷史結果 ---
-# @app.get("/get_flatfoot_results/")
-# async def get_results(user_id: str = "current_user"):
-#     conn = sqlite3.connect('gait_results.db')
-#     c = conn.cursor()
-#     c.execute("SELECT * FROM flatfoot_results WHERE user_id=? ORDER BY timestamp DESC", (user_id,))
-#     results = [{"timestamp": r[0], "probability": r[1], "diagnosis": r[2]} for r in c.fetchall()]
-#     conn.close()
-#     return {"status": "success", "results": results}
+# def simulate_gait_prediction(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+#     """模擬步態預測函數"""
+#     gyro_z = data.get('gyroscope_z', [])
+#     if not gyro_z:
+#         return []
+    
+#     # 簡單的模擬邏輯 - 檢測峰值作為事件
+#     predictions = []
+#     n_samples = len(gyro_z)
+    
+#     # 檢測可能的步態事件
+#     for i in range(1, min(n_samples, 200) - 1):
+#         if abs(gyro_z[i]) > 1.0:  # 閾值檢測
+#             is_peak = (gyro_z[i] > gyro_z[i-1] and gyro_z[i] > gyro_z[i+1])
+#             is_valley = (gyro_z[i] < gyro_z[i-1] and gyro_z[i] < gyro_z[i+1])
+            
+#             if is_peak or is_valley:
+#                 event_type = "HS" if is_peak else "TO"
+#                 confidence = min(abs(gyro_z[i]) / 5.0, 1.0)  # 正規化信度
+                
+#                 predictions.append({
+#                     "time": data.get('timestamp', [0] * n_samples)[i] if data.get('timestamp') else i * 0.016,
+#                     "event": event_type,
+#                     "confidence": round(confidence, 3),
+#                     "gyro_value": round(gyro_z[i], 3),
+#                     "index": i
+#                 })
+    
+#     return predictions[:10]  # 返回前10個預測
 
-# # --- 啟動 ---
+# def calculate_duration(data: Dict[str, Any]) -> float:
+#     """計算數據持續時間"""
+#     timestamps = data.get('timestamp')
+#     if timestamps and len(timestamps) > 1:
+#         return round(timestamps[-1] - timestamps[0], 2)
+#     return round(len(data.get('gyroscope_z', [])) * 0.016, 2)
+
+# def calculate_sample_rate(data: Dict[str, Any]) -> float:
+#     """計算採樣率"""
+#     timestamps = data.get('timestamp')
+#     if timestamps and len(timestamps) > 1:
+#         duration = timestamps[-1] - timestamps[0]
+#         if duration > 0:
+#             return round(len(timestamps) / duration, 1)
+#     return 60.0  # 預設 60Hz
+
+# @app.post("/predict_csv")
+# async def predict_from_csv(file: UploadFile = File(...)):
+#     try:
+#         if gait_model is None:
+#             raise HTTPException(status_code=500, detail="Model not loaded")
+        
+#         # 讀取 CSV 內容
+#         contents = await file.read()
+#         df = pd.read_csv(io.BytesIO(contents))
+        
+#         # 檢查必要欄位
+#         required_columns = ['Gyroscope_Z']
+#         missing_columns = [col for col in required_columns if col not in df.columns]
+#         if missing_columns:
+#             raise HTTPException(
+#                 status_code=400, 
+#                 detail=f"Missing required columns: {missing_columns}. Available columns: {list(df.columns)}"
+#             )
+        
+#         # 模擬 CSV 處理
+#         gyro_z = df['Gyroscope_Z'].values
+#         time_col = df['Time'].values if 'Time' in df.columns else np.arange(len(gyro_z)) * 0.016
+        
+#         # 模擬預測
+#         predictions = []
+#         for i in range(1, min(len(gyro_z), 100) - 1):
+#             if abs(gyro_z[i]) > 0.8:
+#                 is_peak = (gyro_z[i] > gyro_z[i-1] and gyro_z[i] > gyro_z[i+1])
+#                 is_valley = (gyro_z[i] < gyro_z[i-1] and gyro_z[i] < gyro_z[i+1])
+                
+#                 if is_peak or is_valley:
+#                     event_type = "HS" if is_peak else "TO"
+#                     predictions.append({
+#                         "time": float(time_col[i]),
+#                         "event": event_type,
+#                         "value": float(gyro_z[i]),
+#                         "index": i
+#                     })
+        
+#         return {
+#             "status": "success",
+#             "filename": file.filename,
+#             "rows_processed": len(df),
+#             "predictions": predictions[:15],  # 返回前15個預測
+#             "columns": list(df.columns),
+#             "processed_at": datetime.now().isoformat()
+#         }
+        
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"CSV processing error: {str(e)}")
+
+# @app.post("/debug_sensor")
+# async def debug_sensor_data(sensor_data: SensorData):
+#     """調試端點：返回接收到的感測器數據信息"""
+#     data_dict = sensor_data.dict()
+    
+#     stats = {}
+#     for key, value in data_dict.items():
+#         if isinstance(value, list):
+#             stats[key] = {
+#                 "count": len(value),
+#                 "first_5": value[:5] if value else [],
+#                 "min": min(value) if value else None,
+#                 "max": max(value) if value else None,
+#                 "mean": sum(value) / len(value) if value else None
+#             }
+    
+#     return {
+#         "status": "debug",
+#         "data_stats": stats,
+#         "received_at": datetime.now().isoformat()
+#     }
+
 # if __name__ == "__main__":
 #     import uvicorn
 #     port = int(os.environ.get("PORT", 8000))
-#     uvicorn.run("Server:app", host="0.0.0.0", port=port, workers=1, timeout_keep_alive=60)
+#     print(f"Starting server on port {port}")
+#     uvicorn.run(app, host="0.0.0.0", port=port)
+
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from tensorflow.keras.models import load_model
+import tensorflow as tf
+import numpy as np
+from datetime import datetime
+import sqlite3
+import io
+import os
+
+app = FastAPI()
+
+# 禁用 GPU（Render 免費版）
+tf.config.set_visible_devices([], 'GPU')
+
+# --- CORS ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- 初始化資料庫 ---
+def init_db():
+    conn = sqlite3.connect('gait_results.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS flatfoot_results
+                 (timestamp TEXT, probability REAL, diagnosis TEXT, user_id TEXT)''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# --- 載入 V02 模型 ---
+v02_model_path = "V02_Infer.keras"
+if os.path.exists(v02_model_path):
+    try:
+        v02_model = load_model(v02_model_path, compile=False)
+        print(f"✅ 成功載入 V02 模型: {v02_model_path}")
+    except Exception as e:
+        print(f"❌ 載入 V02 模型時發生錯誤: {e}")
+        v02_model = None
+else:
+    print(f"❌ 找不到 V02 模型檔案: {v02_model_path}")
+    v02_model = None
+
+# --- API 根目錄 ---
+@app.get("/")
+def read_root():
+    return {"status": "API is running"}
+
+# --- 預測 HS/TO (dummy 範例) ---
+def predict(model, test_time, test_gyro, window_size=60, distance=40):
+    x_pred = []
+    pred_events = []
+
+    for i in range(window_size, len(test_gyro) - window_size):
+        window = test_gyro[i - window_size: i + window_size + 1].reshape(-1, 1)
+        x_pred.append(window)
+
+    x_pred = np.array(x_pred)
+    y_pred = model.predict(x_pred, verbose=0)
+    pred_labels = np.argmax(y_pred, axis=1)
+
+    last_event_idx = {"HS": -distance, "TO": -distance}
+    hs_distance_threshold = 30
+    to_indices = []
+    in_to_segment = False
+
+    for i in range(1, len(pred_labels)):
+        if pred_labels[i] == 0 and not in_to_segment:
+            start = i
+            in_to_segment = True
+        elif pred_labels[i] != 0 and in_to_segment:
+            end = i - 1
+            if end - start >= 5:
+                seg = test_gyro[start + window_size: end + window_size + 1]
+                local_min_idx = np.argmin(seg)
+                global_idx = start + window_size + local_min_idx
+                if global_idx - last_event_idx["TO"] >= distance:
+                    event_time = test_time[global_idx]
+                    pred_events.append((event_time, "TO"))
+                    to_indices.append(global_idx)
+                    last_event_idx["TO"] = global_idx
+            in_to_segment = False
+
+    if in_to_segment:
+        end = len(pred_labels) - 1
+        if end - start >= 5:
+            seg = test_gyro[start + window_size: end + window_size + 1]
+            local_min_idx = np.argmin(seg)
+            global_idx = start + window_size + local_min_idx
+            if global_idx - last_event_idx["TO"] >= distance:
+                event_time = test_time[global_idx]
+                pred_events.append((event_time, "TO"))
+                to_indices.append(global_idx)
+                last_event_idx["TO"] = global_idx
+
+    last_hs_idx = -distance
+    for i in range(len(to_indices) - 1):
+        start_idx = to_indices[i]
+        end_idx = to_indices[i + 1]
+        if end_idx - start_idx <= 5:
+            continue
+        seg = test_gyro[start_idx:end_idx + 1]
+        local_max_idx = np.argmax(seg)
+        hs_global_idx = start_idx + local_max_idx
+        if hs_global_idx - last_hs_idx >= hs_distance_threshold:
+            event_time = test_time[hs_global_idx]
+            pred_events.append((event_time, "HS"))
+            last_hs_idx = hs_global_idx
+
+    return pred_events
+
+
+# --- API: 上傳 JSON 分析 ---
+@app.post("/analyze_flatfoot/")
+async def analyze_flatfoot(data: dict):
+    """
+    JSON 格式:
+    {
+        "Gyroscope_X": [...],
+        "Gyroscope_Y": [...],
+        "Gyroscope_Z": [...],
+        "Acceleration_X": [...],
+        "Acceleration_Y": [...],
+        "Acceleration_Z": [...]
+    }
+    """
+    try:
+        # 1. 讀 JSON
+        required_cols = ["Gyroscope_X","Gyroscope_Y","Gyroscope_Z",
+                         "Acceleration_X","Acceleration_Y","Acceleration_Z"]
+        for col in required_cols:
+            if col not in data:
+                return JSONResponse(status_code=400, content={"error": f"缺少欄位: {col}"})
+
+        gx = np.array(data["Gyroscope_X"], dtype=np.float32)
+        gy = np.array(data["Gyroscope_Y"], dtype=np.float32)
+        gz = np.array(data["Gyroscope_Z"], dtype=np.float32)
+        ax = np.array(data["Acceleration_X"], dtype=np.float32)
+        ay = np.array(data["Acceleration_Y"], dtype=np.float32)
+        az = np.array(data["Acceleration_Z"], dtype=np.float32)
+
+        # 2. HS/TO 推論
+        hs_to_events = predict_hs_to(gz)
+
+        # 3. V02 模型分析
+        if v02_model is not None:
+            # 將六軸數據做簡單堆疊 (N,6)
+            features = np.stack([gx, gy, gz, ax, ay, az], axis=1)
+            # 模型輸入: (1,N,6) 假設 V02 可以接受整段序列
+            X_input = features[None, ...]
+            probs = v02_model.predict(X_input, verbose=0)  # (1,2)
+            prob_flat = float(probs[0,1])
+            diagnosis = "高風險" if prob_flat >= 0.6 else "正常"
+        else:
+            prob_flat = None
+            diagnosis = "模型未載入"
+
+        # 4. 存入資料庫
+        conn = sqlite3.connect('gait_results.db')
+        c = conn.cursor()
+        c.execute("INSERT INTO flatfoot_results VALUES (?,?,?,?)",
+                  (datetime.now().isoformat(), prob_flat, diagnosis, "current_user"))
+        conn.commit()
+        conn.close()
+
+        # 5. 回傳結果
+        return {
+            "status": "success",
+            "hs_to_events": [{"idx": i, "event": e} for i,e in hs_to_events],
+            "probability": prob_flat,
+            "diagnosis": diagnosis,
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+# --- API: 取得歷史結果 ---
+@app.get("/get_flatfoot_results/")
+async def get_results(user_id: str = "current_user"):
+    conn = sqlite3.connect('gait_results.db')
+    c = conn.cursor()
+    c.execute("SELECT * FROM flatfoot_results WHERE user_id=? ORDER BY timestamp DESC", (user_id,))
+    results = [{"timestamp": r[0], "probability": r[1], "diagnosis": r[2]} for r in c.fetchall()]
+    conn.close()
+    return {"status": "success", "results": results}
+
+# --- 啟動 ---
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("Server:app", host="0.0.0.0", port=port, workers=1, timeout_keep_alive=60)
 
 
 
