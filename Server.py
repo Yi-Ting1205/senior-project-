@@ -725,6 +725,242 @@
 #     uvicorn.run("Server:app", host="0.0.0.0", port=port, workers=1, timeout_keep_alive=60)
 
 
+# from fastapi import FastAPI, UploadFile, File
+# from fastapi.responses import JSONResponse
+# from fastapi.middleware.cors import CORSMiddleware
+# from tensorflow.keras.models import load_model
+# import tensorflow as tf
+# import numpy as np
+# from datetime import datetime
+# import sqlite3
+# import os
+# import pandas as pd
+# from typing import List, Tuple
+
+# app = FastAPI()
+
+# # 禁用 GPU（Render 免費版）
+# tf.config.set_visible_devices([], 'GPU')
+
+# # --- CORS ---
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=["*"],
+#     allow_credentials=True,
+#     allow_methods=["*"],
+#     allow_headers=["*"],
+# )
+
+# # --- 參數設定 (與 V02 一致) ---
+# PAA_IDX = 100
+# WIN_STEPS = 5
+# STRIDE_PAA_WIN = 2
+# FEAT_COLS = ["Gyroscope_X", "Gyroscope_Y", "Gyroscope_Z",
+#              "Acceleration_X", "Acceleration_Y", "Acceleration_Z"]
+
+# # --- 初始化資料庫 ---
+# def init_db():
+#     conn = sqlite3.connect('gait_results.db')
+#     c = conn.cursor()
+#     c.execute('''CREATE TABLE IF NOT EXISTS flatfoot_results
+#                  (timestamp TEXT, probability REAL, diagnosis TEXT, user_id TEXT, 
+#                   n_windows INTEGER, p_normal_mean REAL)''')
+#     conn.commit()
+#     conn.close()
+
+# init_db()
+
+# # --- 載入 V02 模型 ---
+# v02_model_path = "V02_Infer.keras"
+# if os.path.exists(v02_model_path):
+#     try:
+#         v02_model = load_model(v02_model_path, compile=False)
+#         print(f"✅ 成功載入 V02 模型: {v02_model_path}")
+#     except Exception as e:
+#         print(f"❌ 載入 V02 模型時發生錯誤: {e}")
+#         v02_model = None
+# else:
+#     print(f"❌ 找不到 V02 模型檔案: {v02_model_path}")
+#     v02_model = None
+
+# # --- V02 預處理輔助函數 ---
+# def paa_fast(seg: np.ndarray, M: int = 100) -> np.ndarray:
+#     """PAA 時間序列壓縮"""
+#     L, F = seg.shape
+#     idx = (np.linspace(0, L, M + 1)).astype(int)
+#     out = np.add.reduceat(seg, idx[:-1], axis=0)
+#     w = np.maximum(np.diff(idx)[:, None], 1)
+#     return out / w
+
+# def detect_to_events(gz_data: np.ndarray, threshold: float = 0.5) -> np.ndarray:
+#     """檢測 TO (Toe Off) 事件"""
+#     # 簡單的峰值檢測算法，可根據實際數據調整
+#     diff = np.diff(gz_data)
+#     to_indices = np.where(diff > threshold)[0] + 1
+#     return to_indices
+
+# def five_step_windows(paa_list: List[np.ndarray], win: int = 5, stride: int = 2) -> np.ndarray:
+#     """5步窗口拼接"""
+#     n = len(paa_list)
+#     if n < win:
+#         return np.empty((0, win * PAA_IDX, len(FEAT_COLS)), dtype=np.float32)
+    
+#     seqs = []
+#     for s in range(0, n - win + 1, stride):
+#         seq = np.concatenate(paa_list[s:s + win], axis=0)
+#         seqs.append(seq.astype(np.float32))
+    
+#     return np.stack(seqs, axis=0) if seqs else np.empty((0, win * PAA_IDX, len(FEAT_COLS)), dtype=np.float32)
+
+# def preprocess_v02_format(data: dict) -> Tuple[np.ndarray, int]:
+#     """完整的 V02 預處理流程"""
+#     try:
+#         # 提取六軸數據
+#         gx = np.array(data["Gyroscope_X"], dtype=np.float32)
+#         gy = np.array(data["Gyroscope_Y"], dtype=np.float32)
+#         gz = np.array(data["Gyroscope_Z"], dtype=np.float32)
+#         ax = np.array(data["Acceleration_X"], dtype=np.float32)
+#         ay = np.array(data["Acceleration_Y"], dtype=np.float32)
+#         az = np.array(data["Acceleration_Z"], dtype=np.float32)
+        
+#         # 合併為特徵矩陣 (N, 6)
+#         features = np.column_stack([gx, gy, gz, ax, ay, az])
+        
+#         # 檢測 TO 事件
+#         to_indices = detect_to_events(gz)
+        
+#         if len(to_indices) < 2:
+#             return np.empty((0, WIN_STEPS * PAA_IDX, 6)), 0
+        
+#         # TO→TO 切步
+#         paa_list = []
+#         for i in range(len(to_indices) - 1):
+#             start_idx = to_indices[i]
+#             end_idx = to_indices[i + 1]
+            
+#             if end_idx <= start_idx:
+#                 continue
+                
+#             step_data = features[start_idx:end_idx]
+#             if len(step_data) > 10:  # 確保有足夠的數據點
+#                 paa_step = paa_fast(step_data, PAA_IDX)
+#                 paa_list.append(paa_step)
+        
+#         # 5步窗口拼接
+#         X_windows = five_step_windows(paa_list, WIN_STEPS, STRIDE_PAA_WIN)
+        
+#         return X_windows, len(paa_list)
+        
+#     except Exception as e:
+#         print(f"預處理錯誤: {e}")
+#         return np.empty((0, WIN_STEPS * PAA_IDX, 6)), 0
+
+# # --- API 根目錄 ---
+# @app.get("/")
+# def read_root():
+#     return {"status": "API is running", "model_loaded": v02_model is not None}
+
+# # --- API: 上傳 JSON 分析 (V02 兼容版本) ---
+# @app.post("/analyze_flatfoot/")
+# async def analyze_flatfoot(data: dict):
+#     """
+#     JSON 格式:
+#     {
+#         "Gyroscope_X": [...],
+#         "Gyroscope_Y": [...],
+#         "Gyroscope_Z": [...],
+#         "Acceleration_X": [...],
+#         "Acceleration_Y": [...],
+#         "Acceleration_Z": [...]
+#     }
+#     """
+#     try:
+#         # 1. 檢查必要欄位
+#         required_cols = FEAT_COLS
+#         for col in required_cols:
+#             if col not in data:
+#                 return JSONResponse(status_code=400, content={"error": f"缺少欄位: {col}"})
+
+#         # 2. V02 預處理
+#         X_windows, n_steps = preprocess_v02_format(data)
+        
+#         if len(X_windows) == 0:
+#             return JSONResponse(
+#                 status_code=400, 
+#                 content={"error": "無法檢測到足夠的步態周期進行分析", "detected_steps": n_steps}
+#             )
+
+#         # 3. V02 模型分析
+#         if v02_model is not None:
+#             probs = v02_model.predict(X_windows, verbose=0)  # (N, 2)
+            
+#             # 計算平均概率和多數決
+#             p_flat_mean = float(probs[:, 1].mean())
+#             p_normal_mean = float(probs[:, 0].mean())
+#             pred_classes = probs.argmax(axis=1)
+#             majority_vote = int(np.bincount(pred_classes).argmax())
+            
+#             diagnosis = "高風險" if majority_vote == 1 else "正常"
+#         else:
+#             p_flat_mean = None
+#             p_normal_mean = None
+#             majority_vote = None
+#             diagnosis = "模型未載入"
+
+#         # 4. 存入資料庫
+#         conn = sqlite3.connect('gait_results.db')
+#         c = conn.cursor()
+#         c.execute("INSERT INTO flatfoot_results VALUES (?,?,?,?,?,?)",
+#                   (datetime.now().isoformat(), p_flat_mean, diagnosis, 
+#                    "current_user", len(X_windows), p_normal_mean))
+#         conn.commit()
+#         conn.close()
+
+#         # 5. 回傳詳細結果
+#         return {
+#             "status": "success",
+#             "preprocessing": {
+#                 "detected_steps": n_steps,
+#                 "valid_windows": len(X_windows),
+#                 "window_size": f"{WIN_STEPS} steps × {PAA_IDX} points"
+#             },
+#             "probability": p_flat_mean,
+#             "probability_normal": p_normal_mean,
+#             "diagnosis": diagnosis,
+#             "majority_vote": majority_vote,
+#             "timestamp": datetime.now().isoformat()
+#         }
+
+#     except Exception as e:
+#         return JSONResponse(status_code=500, content={"error": str(e)})
+
+# # --- API: 取得歷史結果 ---
+# @app.get("/get_flatfoot_results/")
+# async def get_results(user_id: str = "current_user", limit: int = 10):
+#     conn = sqlite3.connect('gait_results.db')
+#     c = conn.cursor()
+#     c.execute("SELECT * FROM flatfoot_results WHERE user_id=? ORDER BY timestamp DESC LIMIT ?", 
+#               (user_id, limit))
+#     results = [{
+#         "timestamp": r[0], 
+#         "probability": r[1], 
+#         "diagnosis": r[2],
+#         "n_windows": r[4],
+#         "p_normal_mean": r[5]
+#     } for r in c.fetchall()]
+#     conn.close()
+#     return {"status": "success", "results": results}
+
+# # --- 健康檢查端點 ---
+# @app.get("/health")
+# async def health_check():
+#     return {
+#         "status": "healthy",
+#         "model_loaded": v02_model is not None,
+#         "timestamp": datetime.now().isoformat()
+#     }
+
+
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -832,7 +1068,7 @@ def preprocess_v02_format(data: dict) -> Tuple[np.ndarray, int]:
         if len(to_indices) < 2:
             return np.empty((0, WIN_STEPS * PAA_IDX, 6)), 0
         
-        # TO→TO 切步
+        # TO->TO 切步
         paa_list = []
         for i in range(len(to_indices) - 1):
             start_idx = to_indices[i]
@@ -916,40 +1152,46 @@ async def analyze_flatfoot(data: dict):
         conn.commit()
         conn.close()
 
-        # 5. 回傳詳細結果
+        # 5. 回傳詳細結果 (兼容 Swift)
+        result_data = {
+            "timestamp": datetime.now().isoformat(),
+            "probability": p_flat_mean if p_flat_mean is not None else 0.0,
+            "diagnosis": diagnosis
+        }
+        
         return {
             "status": "success",
-            "preprocessing": {
+            "results": [result_data],
+            "preprocessing_info": {
                 "detected_steps": n_steps,
-                "valid_windows": len(X_windows),
-                "window_size": f"{WIN_STEPS} steps × {PAA_IDX} points"
-            },
-            "probability": p_flat_mean,
-            "probability_normal": p_normal_mean,
-            "diagnosis": diagnosis,
-            "majority_vote": majority_vote,
-            "timestamp": datetime.now().isoformat()
+                "valid_windows": len(X_windows)
+            }
         }
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-# --- API: 取得歷史結果 ---
+# --- API: 取得歷史結果 (兼容 Swift) ---
 @app.get("/get_flatfoot_results/")
 async def get_results(user_id: str = "current_user", limit: int = 10):
     conn = sqlite3.connect('gait_results.db')
     c = conn.cursor()
-    c.execute("SELECT * FROM flatfoot_results WHERE user_id=? ORDER BY timestamp DESC LIMIT ?", 
+    c.execute("SELECT timestamp, probability, diagnosis FROM flatfoot_results WHERE user_id=? ORDER BY timestamp DESC LIMIT ?", 
               (user_id, limit))
+    
+    # 確保欄位名稱和類型與 Swift 結構體匹配
     results = [{
         "timestamp": r[0], 
-        "probability": r[1], 
-        "diagnosis": r[2],
-        "n_windows": r[4],
-        "p_normal_mean": r[5]
+        "probability": r[1] if r[1] is not None else 0.0,
+        "diagnosis": r[2]
     } for r in c.fetchall()]
+    
     conn.close()
-    return {"status": "success", "results": results}
+    
+    return {
+        "status": "success", 
+        "results": results
+    }
 
 # --- 健康檢查端點 ---
 @app.get("/health")
