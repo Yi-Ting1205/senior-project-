@@ -8,7 +8,7 @@ import io
 app = FastAPI(title="Arch Detection API", version="1.0")
 
 # -------- 載入模型 --------
-gait_model = tf.keras.models.load_model("gait_model.h5", compile=False)
+gait_model = tf.keras.models.load_model("gait_model_5.h5", compile=False)
 arch_model = tf.keras.models.load_model("weight/V02_Infer.keras", compile=False)
 
 # -------- HS/TO 推論函式 --------
