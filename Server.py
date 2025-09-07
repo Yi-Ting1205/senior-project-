@@ -1,9 +1,15 @@
 import uvicorn
-from fastapi import FastAPI, UploadFile, File
 import pandas as pd
-import numpy as np
 import tensorflow as tf
 import io
+
+import os
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.layers import InputLayer
+from fastapi import FastAPI, UploadFile, File
+import pandas as pd
+from typing import List
 
 app = FastAPI(title="Arch Detection API", version="1.0")
 
