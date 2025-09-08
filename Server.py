@@ -1,23 +1,24 @@
-import uvicorn
-import pandas as pd
-import numpy as np
-import tensorflow as tf
-import io
-import os
-import sqlite3
-from datetime import datetime
 from fastapi import FastAPI, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from typing import List
+from fastapi.middleware.cors import CORSMiddleware
+from tensorflow.keras.models import load_model
+import tensorflow as tf
+import numpy as np
+from datetime import datetime
+import sqlite3
+import os
+import pandas as pd
+import io
+from typing import List, Tuple
 import traceback
-from scipy.signal import find_peaks
-import warnings
-warnings.filterwarnings('ignore')
 
-app = FastAPI(title="Medical Arch Detection API", version="1.0")
+# --- 單一 FastAPI 實例 ---
+app = FastAPI()
 
-# --- CORS 設定 ---
+# 禁用 GPU（Render 免費版）
+tf.config.set_visible_devices([], 'GPU')
+
+# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,351 +27,419 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- 參數設定 ---
+PAA_IDX = 100
+WIN_STEPS = 5
+STRIDE_PAA_WIN = 2
+FEAT_COLS = ["Gyroscope_X", "Gyroscope_Y", "Gyroscope_Z",
+             "Acceleration_X", "Acceleration_Y", "Acceleration_Z"]
+
 # --- 初始化資料庫 ---
 def init_db():
     conn = sqlite3.connect('gait_results.db')
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS arch_results
+    c.execute('''CREATE TABLE IF NOT EXISTS gait_events
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  timestamp TEXT, probability REAL, diagnosis TEXT, 
-                  user_id TEXT, file_name TEXT, windows_count INTEGER,
-                  model_version TEXT, confidence REAL)''')
+                  timestamp TEXT, event_type TEXT, event_time REAL,
+                  file_name TEXT, user_id TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS flatfoot_results
+                 (timestamp TEXT, probability REAL, diagnosis TEXT, user_id TEXT, 
+                  n_windows INTEGER, p_normal_mean REAL, model_source TEXT)''')
     conn.commit()
     conn.close()
 
 init_db()
 
-# --- 模型載入函數 (兼容性版本) ---
-def load_model_with_fallback(model_path, model_type="gait"):
-    """帶有降級載入的模型載入函數"""
-    try:
-        print(f"嘗試載入 {model_type} 模型: {model_path}")
-        
-        # 方法1: 嘗試直接載入
-        try:
-            model = tf.keras.models.load_model(model_path, compile=False)
-            print(f"✅ {model_type} 模型直接載入成功")
-            return model, "original"
-        except Exception as e:
-            print(f"❌ 直接載入失敗: {e}")
-            
-        # 方法2: 嘗試使用 custom_objects
-        try:
-            model = tf.keras.models.load_model(
-                model_path, 
-                compile=False,
-                custom_objects={}
-            )
-            print(f"✅ {model_type} 模型通過 custom_objects 載入成功")
-            return model, "custom_objects"
-        except Exception as e:
-            print(f"❌ custom_objects 載入失敗: {e}")
-            
-        # 方法3: 嘗試重建架構 (針對 gait model)
-        if model_type == "gait" and "gait" in model_path.lower():
-            try:
-                from tensorflow.keras.models import Model
-                from tensorflow.keras.layers import Input, Conv1D, BatchNormalization, GlobalAveragePooling1D, Dense
-                
-                # 根據錯誤信息重建輸入層
-                input_layer = Input(shape=(121, 1), name='input_layer')
-                x = Conv1D(64, 3, activation='relu', padding='causal')(input_layer)
-                x = BatchNormalization()(x)
-                x = Conv1D(128, 3, activation='relu', padding='causal')(x)
-                x = BatchNormalization()(x)
-                x = GlobalAveragePooling1D()(x)
-                x = Dense(64, activation='relu')(x)
-                output = Dense(2, activation='softmax')(x)
-                
-                model = Model(inputs=input_layer, outputs=output)
-                print(f"✅ {model_type} 模型架構重建成功")
-                return model, "reconstructed"
-            except Exception as e:
-                print(f"❌ 模型重建失敗: {e}")
-                
-        return None, "failed"
-        
-    except Exception as e:
-        print(f"❌ {model_type} 模型載入完全失敗: {e}")
-        return None, "failed"
-
-# --- 載入模型 ---
+# --- 載入兩個模型 ---
 gait_model = None
-arch_model = None
-model_status = {
-    "gait_model": "not_loaded",
-    "arch_model": "not_loaded",
-    "gait_version": "",
-    "arch_version": ""
-}
+flatfoot_model = None
+gait_model_loaded = False
+flatfoot_model_loaded = False
 
 print("=" * 60)
-print("🩺 醫療級足弓分析API - 模型載入中...")
+print("開始載入模型...")
+
+# 載入步態檢測模型 (gait_model_5.h5)
+try:
+    if os.path.exists("gait_model_5.h5"):
+        gait_model = load_model("gait_model_5.h5", compile=False)
+        gait_model_loaded = True
+        print("✅ Gait 模型載入成功")
+    else:
+        print("❌ 找不到 gait_model_5.h5")
+except Exception as e:
+    print(f"❌ 載入 Gait 模型失敗: {e}")
+
+# 載入扁平足模型 (V02_Infer.keras)
+try:
+    if os.path.exists("V02_Infer.keras"):
+        flatfoot_model = load_model("V02_Infer.keras", compile=False)
+        flatfoot_model_loaded = True
+        print("✅ Flatfoot 模型載入成功")
+    else:
+        print("❌ 找不到 V02_Infer.keras")
+except Exception as e:
+    print(f"❌ 載入 Flatfoot 模型失敗: {e}")
+
+print(f"模型載入狀態: Gait={gait_model_loaded}, Flatfoot={flatfoot_model_loaded}")
 print("=" * 60)
 
-# 載入 Gait Model
-gait_model, gait_version = load_model_with_fallback("gait_model_5.h5", "gait")
-if gait_model:
-    model_status["gait_model"] = "loaded"
-    model_status["gait_version"] = gait_version
-    print("✅ Gait Model 載入完成")
-else:
-    print("❌ Gait Model 載入失敗 - 服務無法正常運行")
-
-# 載入 Arch Model
-arch_model, arch_version = load_model_with_fallback("V02_Infer.keras", "arch")
-if arch_model:
-    model_status["arch_model"] = "loaded"
-    model_status["arch_version"] = arch_version
-    print("✅ Arch Model 載入完成")
-else:
-    print("❌ Arch Model 載入失敗 - 服務無法正常運行")
-
-print("=" * 60)
-print(f"模型載入狀態: Gait={model_status['gait_model']}, Arch={model_status['arch_model']}")
-print("=" * 60)
-
-# --- 醫療級分析函數 ---
-def medical_detect_hs_to(df: pd.DataFrame):
-    """醫療級 HS/TO 檢測"""
-    if gait_model is None:
-        raise ValueError("Gait Model 未載入，無法進行醫療級分析")
+# --- 步態事件檢測函數 ---
+def predict_gait_events(model, test_time, test_gyro, window_size=60, distance=40):
+    """使用 gait_model_5.h5 檢測步態事件"""
+    if not gait_model_loaded:
+        return []
     
-    try:
-        if "Gyroscope_Z" not in df.columns:
-            raise ValueError("缺少 Gyroscope_Z 數據")
-            
-        test_gyro = df["Gyroscope_Z"].values
-        
-        if len(test_gyro) < 121:
-            raise ValueError("數據長度不足，至少需要121個數據點")
-        
-        # 模型推論
-        x_pred = []
-        window_size = 60
-        
-        for i in range(window_size, len(test_gyro) - window_size):
-            window = test_gyro[i - window_size : i + window_size + 1].reshape(-1, 1)
-            x_pred.append(window)
-            
-        x_pred = np.array(x_pred)
-        if len(x_pred) == 0:
-            raise ValueError("無法生成有效的推論窗口")
-            
-        y_pred = gait_model.predict(x_pred, verbose=0)
-        pred_labels = np.argmax(y_pred, axis=1)
+    x_pred = []
+    pred_events = []
 
-        # 事件檢測邏輯
-        last_event_idx = {"HS": -40, "TO": -40}
-        hs_distance_threshold = 30
-        pred_events = []
-        to_indices = []
-        in_to_segment = False
+    for i in range(window_size, len(test_gyro) - window_size):
+        window = test_gyro[i - window_size : i + window_size + 1].reshape(-1, 1) 
+        x_pred.append(window)
 
-        for i in range(1, len(pred_labels)):
-            if pred_labels[i] == 0 and not in_to_segment:
-                start = i
-                in_to_segment = True
-            elif pred_labels[i] != 0 and in_to_segment:
-                end = i - 1
-                if end - start >= 5:
-                    seg = test_gyro[start + window_size : end + window_size + 1]
-                    local_min_idx = np.argmin(seg)
-                    global_idx = start + window_size + local_min_idx
-                    if global_idx - last_event_idx["TO"] >= 40:
-                        pred_events.append((global_idx, "TO"))
-                        to_indices.append(global_idx)
-                        last_event_idx["TO"] = global_idx
-                in_to_segment = False
+    x_pred = np.array(x_pred)
+    y_pred = model.predict(x_pred, verbose=0)
+    pred_labels = np.argmax(y_pred, axis=1)
+    
+    last_event_idx = {"HS": -distance, "TO": -distance} 
+    hs_distance_threshold = 30
+    to_indices = []
+    in_to_segment = False
 
-        if in_to_segment:
-            end = len(pred_labels) - 1
+    # 檢測 TO 事件
+    for i in range(1, len(pred_labels)):
+        if pred_labels[i] == 0 and not in_to_segment:
+            start = i
+            in_to_segment = True
+        elif pred_labels[i] != 0 and in_to_segment:
+            end = i - 1
             if end - start >= 5:
                 seg = test_gyro[start + window_size : end + window_size + 1]
                 local_min_idx = np.argmin(seg)
                 global_idx = start + window_size + local_min_idx
-                if global_idx - last_event_idx["TO"] >= 40:
-                    pred_events.append((global_idx, "TO"))
+                if global_idx - last_event_idx["TO"] >= distance:
+                    event_time = test_time[global_idx]
+                    pred_events.append((event_time, "TO"))
                     to_indices.append(global_idx)
                     last_event_idx["TO"] = global_idx
+            in_to_segment = False
 
-        last_hs_idx = -40
-        for i in range(len(to_indices) - 1):
-            start_idx = to_indices[i]
-            end_idx = to_indices[i+1]
-            if end_idx - start_idx <= 5:
-                continue
-            seg = test_gyro[start_idx:end_idx+1]
-            local_max_idx = np.argmax(seg)
-            hs_global_idx = start_idx + local_max_idx
-            if hs_global_idx - last_hs_idx >= hs_distance_threshold:
-                pred_events.append((hs_global_idx, "HS"))
-                last_hs_idx = hs_global_idx
+    if in_to_segment:
+        end = len(pred_labels) - 1
+        if end - start >= 5:
+            seg = test_gyro[start + window_size : end + window_size + 1]
+            local_min_idx = np.argmin(seg)
+            global_idx = start + window_size + local_min_idx
+            if global_idx - last_event_idx["TO"] >= distance:
+                event_time = test_time[global_idx]
+                pred_events.append((event_time, "TO"))
+                to_indices.append(global_idx)
+                last_event_idx["TO"] = global_idx
 
-        # 標記結果
-        df["Pred_result"] = ""
-        for idx, event in pred_events:
-            if idx < len(df):
-                df.at[idx, "Pred_result"] = event
-                
-        print(f"醫療級檢測: 找到 {len(pred_events)} 個步態事件")
-        return df
-        
-    except Exception as e:
-        raise Exception(f"醫療級 HS/TO 檢測失敗: {str(e)}")
+    # 檢測 HS 事件
+    last_hs_idx = -distance
+    for i in range(len(to_indices) - 1):
+        start_idx = to_indices[i]
+        end_idx = to_indices[i+1]
+        if end_idx - start_idx <= 5:  
+            continue
+        seg = test_gyro[start_idx:end_idx+1]
+        local_max_idx = np.argmax(seg)
+        hs_global_idx = start_idx + local_max_idx
+        if hs_global_idx - last_hs_idx >= hs_distance_threshold:
+            event_time = test_time[hs_global_idx]
+            pred_events.append((event_time, "HS"))
+            last_hs_idx = hs_global_idx
+    
+    return pred_events
 
-def medical_paa_fast(seg, M=100):
-    """醫療級 PAA 壓縮"""
+# --- 扁平足分析輔助函數 ---
+def paa_fast(seg: np.ndarray, M: int = 100) -> np.ndarray:
+    """PAA 時間序列壓縮"""
     L, F = seg.shape
     idx = (np.linspace(0, L, M + 1)).astype(int)
     out = np.add.reduceat(seg, idx[:-1], axis=0)
     w = np.maximum(np.diff(idx)[:, None], 1)
     return out / w
 
-def medical_build_windows(df):
-    """醫療級窗口構建"""
-    FEAT_COLS = ["Gyroscope_X","Gyroscope_Y","Gyroscope_Z",
-                 "Acceleration_X","Acceleration_Y","Acceleration_Z"]
-
-    # 驗證數據完整性
-    missing_cols = [col for col in FEAT_COLS + ["Pred_result"] if col not in df.columns]
-    if missing_cols:
-        raise ValueError(f"缺少必要數據欄位: {missing_cols}")
-
-    ev = df["Pred_result"].astype(str).str.upper().fillna("")
-    to_idx = df.index[ev.eq("TO")].to_numpy()
+def five_step_windows(paa_list: List[np.ndarray], win: int = 5, stride: int = 2) -> np.ndarray:
+    """5步窗口拼接"""
+    n = len(paa_list)
+    if n < win:
+        return np.empty((0, win * PAA_IDX, len(FEAT_COLS)), dtype=np.float32)
     
-    if len(to_idx) < 2:
-        raise ValueError("TO 事件數量不足，無法進行步態分析")
-
-    paa_list = []
-    g = df[FEAT_COLS].to_numpy(dtype=np.float32)
-
-    # 醫療級數據處理
-    for i in range(len(to_idx) - 1):
-        a, b = int(to_idx[i]), int(to_idx[i+1])
-        if b > a and b - a >= 20:
-            step = g[a:b]
-            paa = medical_paa_fast(step, 100)
-            paa_list.append(paa)
-
-    WIN_STEPS = 5
-    stride = 2
-    
-    if len(paa_list) < WIN_STEPS:
-        raise ValueError(f"步態周期不足: {len(paa_list)} < {WIN_STEPS}")
-
-    # 構建分析窗口
     seqs = []
-    for s in range(0, len(paa_list) - WIN_STEPS + 1, stride):
-        seq = np.concatenate(paa_list[s:s+WIN_STEPS], axis=0)
+    for s in range(0, n - win + 1, stride):
+        seq = np.concatenate(paa_list[s:s + win], axis=0)
         seqs.append(seq.astype(np.float32))
-
-    return np.stack(seqs, axis=0)
-
-def medical_arch_prediction(X_windows):
-    """醫療級扁平足預測"""
-    if arch_model is None:
-        raise ValueError("Arch Model 未載入，無法進行醫療級預測")
     
-    probs = arch_model.predict(X_windows, verbose=0)
-    p_flat = float(probs[:, 1].mean())
-    p_normal = float(probs[:, 0].mean())
-    
-    # 醫療級診斷邏輯
-    if p_flat >= 0.7:
-        diagnosis = "高風險"
-        confidence = p_flat
-    elif p_flat >= 0.5:
-        diagnosis = "中等風險"
-        confidence = p_flat
-    else:
-        diagnosis = "正常"
-        confidence = p_normal
+    return np.stack(seqs, axis=0) if seqs else np.empty((0, win * PAA_IDX, len(FEAT_COLS)), dtype=np.float32)
+
+def preprocess_flatfoot_data_from_csv(csv_content: str) -> Tuple[np.ndarray, int]:
+    """從 CSV 內容預處理扁平足數據"""
+    try:
+        # 讀取 CSV
+        df = pd.read_csv(io.StringIO(csv_content))
         
-    return p_flat, diagnosis, confidence
+        # 檢查必要欄位
+        required_cols = ["Time", "Gyroscope_X", "Gyroscope_Y", "Gyroscope_Z",
+                        "Acceleration_X", "Acceleration_Y", "Acceleration_Z"]
+        
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            print(f"❌ 缺少欄位: {missing_cols}")
+            return np.empty((0, WIN_STEPS * PAA_IDX, 6)), 0
+        
+        # 提取數據
+        time_data = df["Time"].values
+        gx = df["Gyroscope_X"].values.astype(np.float32)
+        gy = df["Gyroscope_Y"].values.astype(np.float32)
+        gz = df["Gyroscope_Z"].values.astype(np.float32)
+        ax = df["Acceleration_X"].values.astype(np.float32)
+        ay = df["Acceleration_Y"].values.astype(np.float32)
+        az = df["Acceleration_Z"].values.astype(np.float32)
+        
+        print(f"數據長度: {len(time_data)} 個樣本")
+        
+        # 合併為特徵矩陣 (N, 6)
+        features = np.column_stack([gx, gy, gz, ax, ay, az])
+        
+        # 使用 gait 模型檢測 TO 事件
+        if gait_model_loaded:
+            gait_events = predict_gait_events(gait_model, time_data, gz)
+            to_indices = [int(event[0]) for event in gait_events if event[1] == "TO"]
+            print(f"Gait 模型檢測到 {len(to_indices)} 個 TO 事件")
+        else:
+            print("❌ Gait 模型未載入，無法檢測 TO 事件")
+            return np.empty((0, WIN_STEPS * PAA_IDX, 6)), 0
+        
+        if len(to_indices) < 2:
+            print("❌ 不足的 TO 事件進行切步")
+            return np.empty((0, WIN_STEPS * PAA_IDX, 6)), 0
+        
+        # TO->TO 切步
+        paa_list = []
+        for i in range(len(to_indices) - 1):
+            start_idx = to_indices[i]
+            end_idx = to_indices[i + 1]
+            
+            if end_idx <= start_idx or end_idx - start_idx < 10:
+                continue
+                
+            step_data = features[start_idx:end_idx]
+            if len(step_data) > 10:
+                paa_step = paa_fast(step_data, PAA_IDX)
+                paa_list.append(paa_step)
+        
+        print(f"成功切分 {len(paa_list)} 個步態周期")
+        
+        if len(paa_list) < WIN_STEPS:
+            print(f"❌ 步態周期不足 {len(paa_list)} < {WIN_STEPS}")
+            return np.empty((0, WIN_STEPS * PAA_IDX, 6)), 0
+        
+        # 5步窗口拼接
+        X_windows = five_step_windows(paa_list, WIN_STEPS, STRIDE_PAA_WIN)
+        print(f"生成 {len(X_windows)} 個分析窗口")
+        
+        return X_windows, len(paa_list)
+        
+    except Exception as e:
+        print(f"預處理錯誤: {e}")
+        traceback.print_exc()
+        return np.empty((0, WIN_STEPS * PAA_IDX, 6)), 0
+
+def predict_flatfoot(X_windows):
+    """使用 flatfoot_model 進行預測"""
+    if not flatfoot_model_loaded or len(X_windows) == 0:
+        return None, None, None, "model_not_loaded"
+    
+    try:
+        print(f"進行扁平足預測，輸入形狀: {X_windows.shape}")
+        probs = flatfoot_model.predict(X_windows, verbose=0)
+        print(f"預測成功，輸出形狀: {probs.shape}")
+        
+        p_flat_mean = float(probs[:, 1].mean())
+        p_normal_mean = float(probs[:, 0].mean())
+        pred_classes = probs.argmax(axis=1)
+        majority_vote = int(np.bincount(pred_classes).argmax())
+        
+        if majority_vote == 1:
+            diagnosis = "高風險" if p_flat_mean >= 0.7 else "中等風險"
+        else:
+            diagnosis = "正常"
+            
+        return p_flat_mean, p_normal_mean, diagnosis, "real_model"
+            
+    except Exception as e:
+        print(f"❌ 預測失敗: {e}")
+        traceback.print_exc()
+        return None, None, None, "prediction_failed"
 
 # --- API 端點 ---
-@app.get("/medical/status")
-async def medical_status():
-    """醫療級服務狀態"""
+@app.get("/")
+def read_root():
     return {
-        "status": "medical_service",
-        "model_status": model_status,
-        "timestamp": datetime.now().isoformat(),
-        "service_level": "medical_grade"
+        "status": "Gait & Flatfoot Analysis API", 
+        "gait_model_loaded": gait_model_loaded,
+        "flatfoot_model_loaded": flatfoot_model_loaded,
+        "timestamp": datetime.now().isoformat()
     }
 
-@app.post("/medical/analyze_flatfoot")
-async def medical_analyze_flatfoot(file: UploadFile = File(...)):
-    """醫療級扁平足分析"""
+@app.post("/predict/")
+async def predict_from_csv(file: UploadFile = File(...)):
+    """檢測步態事件 (HS/TO) - 使用 gait_model_5.h5"""
     try:
-        if not gait_model or not arch_model:
-            return JSONResponse(
-                status_code=503,
-                content={"status": "error", "message": "醫療模型未載入，服務不可用"}
-            )
+        if not gait_model_loaded:
+            return JSONResponse(status_code=503, content={"error": "Gait 模型未載入"})
         
-        print(f"🩺 醫療級分析請求: {file.filename}")
-        
-        # 讀取並驗證數據
-        content = await file.read()
-        df = pd.read_csv(io.StringIO(content.decode("utf-8")))
-        
-        if len(df) < 200:
-            raise ValueError("數據量不足，至少需要200個數據點進行醫療級分析")
-        
-        # 醫療級分析流程
-        df = medical_detect_hs_to(df)
-        X_windows = medical_build_windows(df)
-        
-        if len(X_windows) == 0:
-            raise ValueError("無法形成有效的醫療級分析窗口")
-        
-        # 醫療級預測
-        p_flat, diagnosis, confidence = medical_arch_prediction(X_windows)
-        
-        # 記錄到數據庫
+        contents = await file.read()
+        csv_content = contents.decode('utf-8')
+        df = pd.read_csv(io.StringIO(csv_content))
+
+        if "Gyroscope_Z" not in df.columns or "Time" not in df.columns:
+            return JSONResponse(status_code=400, content={"error": "缺少 'Time' 或 'Gyroscope_Z' 欄位"})
+
+        test_time = df["Time"].values
+        test_gyro = df["Gyroscope_Z"].values
+
+        results = predict_gait_events(gait_model, test_time, test_gyro)
+
+        # 存入資料庫
         conn = sqlite3.connect('gait_results.db')
         c = conn.cursor()
-        c.execute('''INSERT INTO arch_results 
-                    (timestamp, probability, diagnosis, user_id, file_name, windows_count, model_version, confidence)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-                  (datetime.now().isoformat(), p_flat, diagnosis, 
-                   "medical_user", file.filename, len(X_windows), 
-                   f"gait_{model_status['gait_version']}_arch_{model_status['arch_version']}", confidence))
+        for time, event in results:
+            c.execute("INSERT INTO gait_events (timestamp, event_type, event_time, file_name, user_id) VALUES (?, ?, ?, ?, ?)",
+                      (datetime.now().isoformat(), event, float(time), file.filename, "current_user"))
         conn.commit()
         conn.close()
-        
-        # 醫療級回應
+
         return {
-            "status": "medical_success",
-            "result": {
-                "timestamp": datetime.now().isoformat(),
-                "probability": round(p_flat, 4),
-                "diagnosis": diagnosis,
-                "confidence": round(confidence, 4),
-                "analysis_level": "medical_grade"
-            },
-            "metadata": {
-                "windows_analyzed": len(X_windows),
-                "model_versions": model_status
+            "status": "success", 
+            "predictions": [{"time": float(t), "event": e} for t, e in results],
+            "file": file.filename
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/analyze_flatfoot/")
+async def analyze_flatfoot(file: UploadFile = File(...)):
+    """分析扁平足風險 - 使用 CSV 文件"""
+    try:
+        print("收到扁平足分析請求")
+        
+        if not flatfoot_model_loaded:
+            return JSONResponse(status_code=503, content={"error": "Flatfoot 模型未載入"})
+        
+        # 讀取 CSV 內容
+        contents = await file.read()
+        csv_content = contents.decode('utf-8')
+        
+        # 預處理數據
+        X_windows, n_steps = preprocess_flatfoot_data_from_csv(csv_content)
+        
+        if len(X_windows) == 0:
+            error_msg = "無法從數據中提取有效的步態窗口"
+            return JSONResponse(status_code=400, content={"error": error_msg})
+
+        # 進行預測
+        p_flat_mean, p_normal_mean, diagnosis, model_source = predict_flatfoot(X_windows)
+        
+        if p_flat_mean is None:
+            return JSONResponse(status_code=500, content={"error": "預測失敗"})
+
+        # 存入資料庫
+        conn = sqlite3.connect('gait_results.db')
+        c = conn.cursor()
+        c.execute("INSERT INTO flatfoot_results VALUES (?,?,?,?,?,?,?)",
+                  (datetime.now().isoformat(), p_flat_mean, diagnosis, 
+                   "current_user", len(X_windows), p_normal_mean, model_source))
+        conn.commit()
+        conn.close()
+
+        # 返回結果
+        result_data = {
+            "timestamp": datetime.now().isoformat(),
+            "probability": round(p_flat_mean, 4),
+            "diagnosis": diagnosis,
+            "confidence": round(p_normal_mean, 4)
+        }
+        
+        response = {
+            "status": "success",
+            "results": [result_data],
+            "analysis_info": {
+                "detected_steps": n_steps,
+                "valid_windows": len(X_windows),
+                "model_source": model_source
             }
         }
         
-    except Exception as e:
-        error_msg = f"醫療級分析錯誤: {str(e)}"
-        print(f"❌ {error_msg}")
-        return JSONResponse(
-            status_code=400,
-            content={"status": "medical_error", "message": error_msg}
-        )
+        return response
 
-# --- 啟動 ---
+    except Exception as e:
+        error_msg = f"分析過程中發生錯誤: {str(e)}"
+        print(error_msg)
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"error": error_msg})
+
+@app.get("/get_gait_results/")
+async def get_gait_results(limit: int = 10):
+    """獲取步態事件結果"""
+    try:
+        conn = sqlite3.connect('gait_results.db')
+        c = conn.cursor()
+        c.execute("SELECT timestamp, event_type, event_time, file_name FROM gait_events ORDER BY timestamp DESC LIMIT ?", (limit,))
+        
+        results = [{
+            "timestamp": r[0], 
+            "event_type": r[1],
+            "event_time": r[2],
+            "file_name": r[3]
+        } for r in c.fetchall()]
+        
+        conn.close()
+        
+        return {"status": "success", "results": results}
+    
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/get_flatfoot_results/")
+async def get_flatfoot_results(limit: int = 10):
+    """獲取扁平足分析結果"""
+    try:
+        conn = sqlite3.connect('gait_results.db')
+        c = conn.cursor()
+        c.execute("SELECT timestamp, probability, diagnosis, n_windows FROM flatfoot_results ORDER BY timestamp DESC LIMIT ?", (limit,))
+        
+        results = [{
+            "timestamp": r[0], 
+            "probability": r[1],
+            "diagnosis": r[2],
+            "windows_analyzed": r[3]
+        } for r in c.fetchall()]
+        
+        conn.close()
+        
+        return {"status": "success", "results": results}
+    
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "gait_model_loaded": gait_model_loaded,
+        "flatfoot_model_loaded": flatfoot_model_loaded,
+        "timestamp": datetime.now().isoformat()
+    }
+
 if __name__ == "__main__":
+    import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    print(f"🩺 啟動醫療級服務在端口 {port}")
-    uvicorn.run(app, host="0.0.0.0", port=port, workers=1)
+    uvicorn.run("Server:app", host="0.0.0.0", port=port, workers=1, timeout_keep_alive=60)
+
 # import uvicorn
 # import pandas as pd
 # import numpy as np
