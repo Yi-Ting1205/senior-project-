@@ -61,12 +61,6 @@ flatfoot_model_loaded = False
 print("=" * 60)
 print("開始載入模型...")
 
-
-# ... [前面的導入和其他程式碼保持不變] ...
-
-print("=" * 60)
-print("開始載入模型...")
-
 # 載入步態檢測模型 (gait_model_5.keras)
 try:
     if os.path.exists("gait_model_5.keras"):
