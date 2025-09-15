@@ -61,16 +61,56 @@ flatfoot_model_loaded = False
 print("=" * 60)
 print("開始載入模型...")
 
-# 載入步態檢測模型 (gait_model_5.h5)
+
+# ... [前面的導入和其他程式碼保持不變] ...
+
+print("=" * 60)
+print("開始載入模型...")
+
+# 載入步態檢測模型 (gait_model_5.keras)
 try:
     if os.path.exists("gait_model_5.keras"):
-        gait_model = load_model("gait_model_5.keras", compile=False)
+        print("嘗試載入 gait_model_5.keras...")
+        # 嘗試不同的載入方式
+        try:
+            # 方式1: 使用 tf.keras.models.load_model
+            gait_model = tf.keras.models.load_model("gait_model_5.keras", compile=False)
+            print("✅ Gait 模型通過 tf.keras.models.load_model 載入成功")
+        except Exception as e1:
+            print(f"方式1失敗: {e1}")
+            try:
+                # 方式2: 使用 load_model 並指定 custom_objects
+                gait_model = load_model("gait_model_5.keras", compile=False)
+                print("✅ Gait 模型通過 keras.load_model 載入成功")
+            except Exception as e2:
+                print(f"方式2失敗: {e2}")
+                try:
+                    # 方式3: 嘗試使用安全模式載入
+                    gait_model = tf.keras.models.load_model("gait_model_5.keras", compile=False, safe_mode=False)
+                    print("✅ Gait 模型通過安全模式載入成功")
+                except Exception as e3:
+                    print(f"方式3失敗: {e3}")
+                    raise e3
+        
         gait_model_loaded = True
-        print("✅ Gait 模型載入成功")
+        print(f"Gait 模型輸入形狀: {gait_model.input_shape}")
+        print(f"Gait 模型輸出形狀: {gait_model.output_shape}")
     else:
         print("❌ 找不到 gait_model_5.keras")
+        # 檢查是否有 .h5 檔案可以轉換
+        if os.path.exists("gait_model_5.h5"):
+            print("發現 gait_model_5.h5，嘗試轉換...")
+            try:
+                convert_h5_to_keras("gait_model_5.h5", "gait_model_5.keras")
+                gait_model = tf.keras.models.load_model("gait_model_5.keras", compile=False)
+                gait_model_loaded = True
+                print("✅ H5 轉換並載入成功")
+            except Exception as conv_e:
+                print(f"❌ 轉換失敗: {conv_e}")
 except Exception as e:
     print(f"❌ 載入 Gait 模型失敗: {e}")
+    print("詳細錯誤信息:")
+    traceback.print_exc()
 
 # 載入扁平足模型 (V02_Infer.keras)
 try:
@@ -82,6 +122,63 @@ try:
         print("❌ 找不到 V02_Infer.keras")
 except Exception as e:
     print(f"❌ 載入 Flatfoot 模型失敗: {e}")
+
+print(f"模型載入狀態: Gait={gait_model_loaded}, Flatfoot={flatfoot_model_loaded}")
+print("=" * 60)
+
+# 添加模型轉換函數
+def convert_h5_to_keras(h5_path, keras_path):
+    """將 H5 模型轉換為 Keras 格式"""
+    print(f"正在轉換 {h5_path} 到 {keras_path}...")
+    try:
+        # 嘗試不同的載入方式
+        try:
+            model = tf.keras.models.load_model(h5_path, compile=False)
+        except:
+            # 如果直接載入失敗，嘗試使用 h5py 手動重建
+            import h5py
+            with h5py.File(h5_path, 'r') as f:
+                model_config = f.attrs.get('model_config')
+                if model_config is None:
+                    raise ValueError("無法讀取模型配置")
+                
+                model_config = model_config.decode('utf-8') if isinstance(model_config, bytes) else model_config
+                model = tf.keras.models.model_from_json(model_config)
+                
+                # 載入權重
+                if 'model_weights' in f:
+                    model.load_weights(h5_path)
+        
+        # 儲存為 Keras 格式
+        model.save(keras_path, save_format='keras')
+        print(f"✅ 轉換成功: {keras_path}")
+        
+    except Exception as e:
+        print(f"❌ 轉換失敗: {e}")
+        raise e
+
+# ... [後面的程式碼保持不變] ...
+# # 載入步態檢測模型 (gait_model_5.h5)
+# try:
+#     if os.path.exists("gait_model_5.keras"):
+#         gait_model = load_model("gait_model_5.keras", compile=False)
+#         gait_model_loaded = True
+#         print("✅ Gait 模型載入成功")
+#     else:
+#         print("❌ 找不到 gait_model_5.keras")
+# except Exception as e:
+#     print(f"❌ 載入 Gait 模型失敗: {e}")
+
+# # 載入扁平足模型 (V02_Infer.keras)
+# try:
+#     if os.path.exists("V02_Infer.keras"):
+#         flatfoot_model = load_model("V02_Infer.keras", compile=False)
+#         flatfoot_model_loaded = True
+#         print("✅ Flatfoot 模型載入成功")
+#     else:
+#         print("❌ 找不到 V02_Infer.keras")
+# except Exception as e:
+    # print(f"❌ 載入 Flatfoot 模型失敗: {e}")
 
 print(f"模型載入狀態: Gait={gait_model_loaded}, Flatfoot={flatfoot_model_loaded}")
 print("=" * 60)
