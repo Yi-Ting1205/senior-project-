@@ -63,12 +63,12 @@ print("開始載入模型...")
 
 # 載入步態檢測模型 (gait_model_5.h5)
 try:
-    if os.path.exists("gait_model_5.h5"):
-        gait_model = load_model("gait_model_5.h5", compile=False)
+    if os.path.exists("gait_model_5.keras"):
+        gait_model = load_model("gait_model_5.keras", compile=False)
         gait_model_loaded = True
         print("✅ Gait 模型載入成功")
     else:
-        print("❌ 找不到 gait_model_5.h5")
+        print("❌ 找不到 gait_model_5.keras")
 except Exception as e:
     print(f"❌ 載入 Gait 模型失敗: {e}")
 
