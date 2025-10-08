@@ -39,7 +39,7 @@ FEAT_COLS = ["Gyroscope_X","Gyroscope_Y","Gyroscope_Z",
 def load_arch_model():
     """加載足弓分析模型"""
     try:
-        model_path = r"C:\GITHUB\GaitHelper\weight\V02_Infer.keras"
+        model_path = r"V02_Infer.keras"
         model = tf.keras.models.load_model(model_path, compile=False)
         print("✅ 足弓分析模型加載成功")
         return model
