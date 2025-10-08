@@ -168,24 +168,24 @@ print("開始載入模型...")
 
 # 載入步態檢測模型 (gait_model_5.keras)
 try:
-    if os.path.exists("gait_model_5.keras"):
-        print("嘗試載入 gait_model_5.keras...")
+    if os.path.exists("gait_model_5.h5"):
+        print("嘗試載入 gait_model_5.h5...")
         # 嘗試不同的載入方式
         try:
             # 方式1: 使用 tf.keras.models.load_model
-            gait_model = tf.keras.models.load_model("gait_model_5.keras", compile=False)
+            gait_model = tf.keras.models.load_model("gait_model_5.h5", compile=False)
             print("✅ Gait 模型通過 tf.keras.models.load_model 載入成功")
         except Exception as e1:
             print(f"方式1失敗: {e1}")
             try:
                 # 方式2: 使用 load_model 並指定 custom_objects
-                gait_model = load_model("gait_model_5.keras", compile=False)
+                gait_model = load_model("gait_model_5.h5", compile=False)
                 print("✅ Gait 模型通過 keras.load_model 載入成功")
             except Exception as e2:
                 print(f"方式2失敗: {e2}")
                 try:
                     # 方式3: 嘗試使用安全模式載入
-                    gait_model = tf.keras.models.load_model("gait_model_5.keras", compile=False, safe_mode=False)
+                    gait_model = tf.keras.models.load_model("gait_model_5.h5", compile=False, safe_mode=False)
                     print("✅ Gait 模型通過安全模式載入成功")
                 except Exception as e3:
                     print(f"方式3失敗: {e3}")
