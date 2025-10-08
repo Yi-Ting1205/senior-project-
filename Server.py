@@ -256,29 +256,6 @@ def convert_h5_to_keras(h5_path, keras_path):
         print(f"❌ 轉換失敗: {e}")
         raise e
 
-# ... [後面的程式碼保持不變] ...
-# # 載入步態檢測模型 (gait_model_5.h5)
-# try:
-#     if os.path.exists("gait_model_5.keras"):
-#         gait_model = load_model("gait_model_5.keras", compile=False)
-#         gait_model_loaded = True
-#         print("✅ Gait 模型載入成功")
-#     else:
-#         print("❌ 找不到 gait_model_5.keras")
-# except Exception as e:
-#     print(f"❌ 載入 Gait 模型失敗: {e}")
-
-# # 載入扁平足模型 (V02_Infer.keras)
-# try:
-#     if os.path.exists("V02_Infer.keras"):
-#         flatfoot_model = load_model("V02_Infer.keras", compile=False)
-#         flatfoot_model_loaded = True
-#         print("✅ Flatfoot 模型載入成功")
-#     else:
-#         print("❌ 找不到 V02_Infer.keras")
-# except Exception as e:
-    # print(f"❌ 載入 Flatfoot 模型失敗: {e}")
-
 print(f"模型載入狀態: Gait={gait_model_loaded}, Flatfoot={flatfoot_model_loaded}")
 print("=" * 60)
 
