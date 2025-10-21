@@ -24,22 +24,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 載入模型 - 針對 Render 部署優化
+# 載入模型
 try:
     logger.info("正在載入步態分析模型...")
-    # 檢查模型文件是否存在
     model_path = "gait_model_5.h5"
     if not os.path.exists(model_path):
-        # 如果在 Render 環境中，嘗試其他路徑
         model_path = os.path.join(os.path.dirname(__file__), "gait_model_5.h5")
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"模型文件未找到: {model_path}")
     
     model = load_model(model_path)
     logger.info("模型載入成功")
 except Exception as e:
     logger.error(f"模型載入失敗: {str(e)}")
-    # 在 Render 環境中，如果模型加載失敗，創建一個模擬模型用於測試
     model = None
     logger.warning("使用模擬模式運行（僅用於測試）")
 
@@ -68,8 +63,11 @@ def predict(model, test_time: np.ndarray, test_gyro: np.ndarray, window_size: in
     x_pred = np.array(x_pred)
     
     # 模型預測
+    logger.info(f"開始模型預測，數據形狀: {x_pred.shape}")
     y_pred = model.predict(x_pred, verbose=0)
     pred_labels = np.argmax(y_pred, axis=1)
+    
+    logger.info(f"預測完成，預測標籤分布: {np.bincount(pred_labels)}")
     
     # 事件檢測參數
     last_event_idx = {"HS": -distance, "TO": -distance} 
@@ -123,6 +121,7 @@ def predict(model, test_time: np.ndarray, test_gyro: np.ndarray, window_size: in
             pred_events.append((event_time, "HS"))
             last_hs_idx = hs_global_idx
     
+    logger.info(f"事件檢測完成: {len(pred_events)} 個事件 (HS: {len([e for e in pred_events if e[1]=='HS'])}, TO: {len([e for e in pred_events if e[1]=='TO'])})")
     return pred_events
 
 @app.post("/predict/")
@@ -146,6 +145,7 @@ async def predict_from_csv(file: UploadFile = File(...)):
         # 解析CSV數據
         try:
             df = pd.read_csv(io.BytesIO(contents))
+            logger.info(f"CSV解析成功，數據形狀: {df.shape}")
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"CSV解析失敗: {str(e)}")
 
@@ -169,6 +169,8 @@ async def predict_from_csv(file: UploadFile = File(...)):
         test_time = df["Time"].values
         test_gyro = df["Gyroscope_Z"].values
 
+        logger.info(f"數據統計 - Time範圍: [{test_time.min():.3f}, {test_time.max():.3f}], Gyro範圍: [{test_gyro.min():.3f}, {test_gyro.max():.3f}]")
+
         # 數據預處理檢查
         if np.isnan(test_gyro).any() or np.isnan(test_time).any():
             raise HTTPException(status_code=400, detail="數據包含無效值(NaN)")
@@ -183,7 +185,7 @@ async def predict_from_csv(file: UploadFile = File(...)):
         # 格式化結果
         formatted_results = [{"time": float(t), "event": e} for t, e in results]
 
-        return {
+        response_data = {
             "status": "success", 
             "filename": file.filename,
             "data_points": len(test_gyro),
@@ -191,11 +193,22 @@ async def predict_from_csv(file: UploadFile = File(...)):
             "predictions": formatted_results
         }
         
+        logger.info(f"返回響應: {len(results)} 個預測事件")
+        return response_data
+        
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"預測過程中發生錯誤: {str(e)}")
         raise HTTPException(status_code=500, detail=f"伺服器內部錯誤: {str(e)}")
+
+# 添加根路徑的 predict 端點以兼容舊版本
+@app.post("/")
+async def predict_root(file: UploadFile = File(...)):
+    """
+    根路徑的預測端點（用於兼容）
+    """
+    return await predict_from_csv(file)
 
 @app.get("/")
 async def root():
@@ -224,6 +237,12 @@ def init_db():
     """初始化數據庫（用於 Render 部署兼容性）"""
     logger.info("數據庫初始化完成（模擬函數）")
     return True
+
+# 修復端口綁定問題
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
 # 用於 Gunicorn 的應用程序變量
 # 如果你的 WSGI 伺服器需要這個
