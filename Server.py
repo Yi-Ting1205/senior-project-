@@ -1,13 +1,21 @@
 
 from fastapi.middleware.cors import CORSMiddleware
 from tensorflow.keras.models import load_model
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 import pandas as pd
 import numpy as np
 import io
+import logging
+from typing import List, Tuple
 
-app = FastAPI()
+# 配置日誌
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Gait Analysis API", version="1.0.0")
+
+# CORS 中間件
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  
@@ -15,24 +23,51 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-model = load_model("gait_model_5.h5")
 
-def predict(model, test_time, test_gyro, window_size=60, distance=40):
+# 載入模型
+try:
+    logger.info("正在載入步態分析模型...")
+    model = load_model("gait_model_5.h5")
+    logger.info("模型載入成功")
+except Exception as e:
+    logger.error(f"模型載入失敗: {str(e)}")
+    raise RuntimeError(f"無法載入模型: {str(e)}")
+
+def predict(model, test_time: np.ndarray, test_gyro: np.ndarray, window_size: int = 60, distance: int = 40) -> List[Tuple[float, str]]:
+    """
+    使用訓練好的模型預測步態事件
+    
+    Args:
+        model: 訓練好的Keras模型
+        test_time: 時間序列數據
+        test_gyro: 陀螺儀Z軸數據
+        window_size: 滑動窗口大小
+        distance: 事件間最小距離閾值
+    
+    Returns:
+        List[Tuple[float, str]]: 預測的事件列表，每個事件包含時間和類型
+    """
     x_pred = []
     pred_events = []
 
+    # 準備預測數據
     for i in range(window_size, len(test_gyro) - window_size):
-        window = test_gyro[i - window_size : i + window_size + 1 ].reshape(-1, 1) 
+        window = test_gyro[i - window_size : i + window_size + 1].reshape(-1, 1) 
         x_pred.append(window)
 
     x_pred = np.array(x_pred)
-    y_pred = model.predict( x_pred, verbose=0)
-    pred_labels = np.argmax( y_pred, axis=1 )
+    
+    # 模型預測
+    y_pred = model.predict(x_pred, verbose=0)
+    pred_labels = np.argmax(y_pred, axis=1)
+    
+    # 事件檢測參數
     last_event_idx = {"HS": -distance, "TO": -distance} 
     hs_distance_threshold = 30
     to_indices = []
     in_to_segment = False
 
+    # 檢測 TO (Toe-Off) 事件
     for i in range(1, len(pred_labels)):
         if pred_labels[i] == 0 and not in_to_segment:
             start = i
@@ -50,6 +85,7 @@ def predict(model, test_time, test_gyro, window_size=60, distance=40):
                     last_event_idx["TO"] = global_idx
             in_to_segment = False
 
+    # 處理最後一個可能的 TO 事件段
     if in_to_segment:
         end = len(pred_labels) - 1
         if end - start >= 5:
@@ -61,6 +97,8 @@ def predict(model, test_time, test_gyro, window_size=60, distance=40):
                 pred_events.append((event_time, "TO"))
                 to_indices.append(global_idx)
                 last_event_idx["TO"] = global_idx
+
+    # 檢測 HS (Heel-Strike) 事件
     last_hs_idx = -distance
     for i in range(len(to_indices) - 1):
         start_idx = to_indices[i]
@@ -79,24 +117,104 @@ def predict(model, test_time, test_gyro, window_size=60, distance=40):
 
 @app.post("/predict/")
 async def predict_from_csv(file: UploadFile = File(...)):
+    """
+    從上傳的CSV檔案進行步態事件預測
+    
+    Args:
+        file: 包含時間和陀螺儀數據的CSV檔案
+    
+    Returns:
+        JSONResponse: 包含預測結果或錯誤信息
+    """
     try:
+        # 檢查檔案類型
+        if not file.filename.endswith('.csv'):
+            raise HTTPException(status_code=400, detail="請上傳CSV檔案")
+        
+        logger.info(f"正在處理檔案: {file.filename}")
+        
+        # 讀取檔案內容
         contents = await file.read()
-        df = pd.read_csv(io.BytesIO(contents))
+        
+        if len(contents) == 0:
+            raise HTTPException(status_code=400, detail="檔案為空")
+        
+        # 解析CSV數據
+        try:
+            df = pd.read_csv(io.BytesIO(contents))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"CSV解析失敗: {str(e)}")
 
-        # 檢查欄位
-        if "Gyroscope_Z" not in df.columns or "Time" not in df.columns:
-            return JSONResponse(status_code=400, content={"error": "缺少 'Time' 或 'Gyroscope_Z' 欄位"})
+        # 檢查必要欄位
+        required_columns = ["Gyroscope_Z", "Time"]
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        if missing_columns:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"缺少必要欄位: {', '.join(missing_columns)}"
+            )
 
+        # 檢查數據有效性
+        if df.empty or len(df) < 120:  # 至少需要 window_size * 2 的數據點
+            raise HTTPException(
+                status_code=400, 
+                detail="數據量不足，請確保數據點數量大於120"
+            )
+
+        # 提取數據
         test_time = df["Time"].values
         test_gyro = df["Gyroscope_Z"].values
 
-        # 預測
+        # 數據預處理檢查
+        if np.isnan(test_gyro).any() or np.isnan(test_time).any():
+            raise HTTPException(status_code=400, detail="數據包含無效值(NaN)")
+
+        logger.info(f"開始預測，數據長度: {len(test_gyro)}")
+
+        # 執行預測
         results = predict(model, test_time, test_gyro)
 
-        return {"status": "success", "predictions": [{"time": t, "event": e} for t, e in results]}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        logger.info(f"預測完成，檢測到 {len(results)} 個事件")
 
+        # 格式化結果
+        formatted_results = [{"time": float(t), "event": e} for t, e in results]
+
+        return {
+            "status": "success", 
+            "filename": file.filename,
+            "data_points": len(test_gyro),
+            "predictions_count": len(results),
+            "predictions": formatted_results
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"預測過程中發生錯誤: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"伺服器內部錯誤: {str(e)}")
+
+@app.get("/")
+async def root():
+    """API 根端點"""
+    return {
+        "message": "步態分析API服務運行中",
+        "version": "1.0.0",
+        "endpoints": {
+            "predict": "POST /predict/ - 上傳CSV檔案進行步態事件預測"
+        }
+    }
+
+@app.get("/health")
+async def health_check():
+    """健康檢查端點"""
+    return {
+        "status": "healthy",
+        "model_loaded": model is not None
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
 
 # from fastapi import FastAPI, UploadFile, File
 # from fastapi.responses import JSONResponse
